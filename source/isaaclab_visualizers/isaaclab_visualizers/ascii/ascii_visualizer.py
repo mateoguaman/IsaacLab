@@ -61,7 +61,11 @@ class AsciiVisualizer(BaseVisualizer):
 
         camera_pos, camera_target = self._resolve_initial_camera_pose()
         self._viewer = ViewerAscii(
+            output_mode=self.cfg.output_mode,
             ascii_cli_path=self.cfg.ascii_cli_path,
+            fifo_path=self.cfg.fifo_path,
+            tcp_host=self.cfg.tcp_host,
+            tcp_port=self.cfg.tcp_port,
             render_width=self.cfg.render_width,
             render_height=self.cfg.render_height,
             sample_res=self.cfg.sample_res,
@@ -82,11 +86,18 @@ class AsciiVisualizer(BaseVisualizer):
         self._last_camera_pose = (camera_pos, camera_target)
 
         num_visualized_envs = len(self._env_ids) if self._env_ids is not None else int(metadata.get("num_envs", 0))
+        if self.cfg.output_mode == "inline":
+            transport_row = ("ascii_cli_path", self.cfg.ascii_cli_path)
+        elif self.cfg.output_mode == "fifo":
+            transport_row = ("fifo_path", self.cfg.fifo_path or "(auto)")
+        else:
+            transport_row = ("tcp_endpoint", f"{self.cfg.tcp_host}:{self.cfg.tcp_port}")
         self._log_initialization_table(
             logger=logger,
             title="AsciiVisualizer Configuration",
             rows=[
-                ("ascii_cli_path", self.cfg.ascii_cli_path),
+                ("output_mode", self.cfg.output_mode),
+                transport_row,
                 ("render_size", f"{self.cfg.render_width}x{self.cfg.render_height}"),
                 ("sample_res", self.cfg.sample_res),
                 ("color_mode", self.cfg.color_mode),

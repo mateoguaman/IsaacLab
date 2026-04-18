@@ -25,12 +25,40 @@ class AsciiVisualizerCfg(VisualizerCfg):
     visualizer_type: str = "ascii"
     """Type identifier for ASCII visualizer."""
 
+    output_mode: Literal["inline", "fifo", "tcp"] = "fifo"
+    """Where raw RGBA frames are sent.
+
+    * ``inline`` — spawn ``ascii-cli`` as a child process and feed its stdin. The
+      subprocess inherits the parent's stdout, so ANSI output lands in the
+      controlling terminal. Best for standalone demos. In a training run it
+      interleaves with stdout logs (``print``, ``logger``, metric tables) and
+      in alt-screen mode obliterates them — do not use for IsaacLab training.
+    * ``fifo`` — create a named pipe on the filesystem; emit raw RGBA to it.
+      The parent terminal is untouched. A second terminal consumes frames via
+      ``cat <fifo_path> | ascii-cli --raw-in WxH`` (command is logged at init).
+    * ``tcp`` — bind a TCP listener on ``(tcp_host, tcp_port)``; emit raw RGBA
+      to whichever client is connected. Works across SSH / cluster boundaries.
+      Consumer: ``nc <host> <port> | ascii-cli --raw-in WxH``.
+    """
+
     ascii_cli_path: str = "ascii-cli"
-    """Path (or command on PATH) to the ascii-cli Node.js executable.
+    """Path to the ``ascii-cli`` executable. Used only in ``output_mode='inline'``.
 
     Defaults to ``ascii-cli`` on PATH. Set to an absolute path when the CLI is
     installed in a checkout (e.g. ``/path/to/ascii_renderer/bin/ascii-cli.mjs``).
     """
+
+    fifo_path: str | None = None
+    """Filesystem path for ``output_mode='fifo'``. ``None`` auto-generates
+    ``/tmp/isaac-ascii-<pid>.fifo``."""
+
+    tcp_host: str = "127.0.0.1"
+    """Bind address for ``output_mode='tcp'``. Use ``0.0.0.0`` to accept
+    connections from other hosts (careful: frames are unencrypted)."""
+
+    tcp_port: int = 5555
+    """TCP port for ``output_mode='tcp'``. Pass ``0`` to let the OS assign an
+    ephemeral free port (the chosen port is logged at init)."""
 
     render_width: int = 320
     """Offscreen RGBA render width in pixels. Gets resampled by ascii-cli into

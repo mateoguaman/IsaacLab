@@ -15,9 +15,12 @@ the RGBA bytes to the ascii-cli subprocess stdin.
 from __future__ import annotations
 
 import atexit
+import errno
 import logging
 import math
+import os
 import shutil
+import socket
 import subprocess
 from typing import Any
 
@@ -27,6 +30,10 @@ import newton
 from newton._src.viewer.viewer import ViewerBase
 
 logger = logging.getLogger(__name__)
+
+# Linux F_SETPIPE_SZ fcntl op. Not exposed via fcntl module names on all
+# platforms; hard-coded so we don't force a Linux-only import.
+_F_SETPIPE_SZ = 1031
 
 
 def _to_numpy(arr: Any) -> np.ndarray | None:
@@ -217,12 +224,267 @@ class NumpyRasterizer:
         sub_color[mask] = color
 
 
+class _Transport:
+    """Output transport for RGBA frames. Subclasses own one channel (inline
+    subprocess, named FIFO, or TCP client) and implement write/close."""
+
+    def start(self, render_w: int, render_h: int) -> None:
+        raise NotImplementedError
+
+    def write(self, rgba: bytes) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def is_alive(self) -> bool:
+        """Whether the transport is still functional (used by is_running)."""
+        return True
+
+
+def _resolve_ascii_cli(path: str) -> str:
+    """Locate ``ascii-cli`` via explicit path, PATH, or the ``.mjs`` variant."""
+    if "/" in path or path.endswith(".mjs"):
+        return path
+    found = shutil.which(path)
+    if found:
+        return found
+    for candidate in (f"{path}.mjs", "ascii-cli.mjs"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    raise FileNotFoundError(
+        f"Could not locate ascii-cli executable '{path}'. Pass an absolute path via "
+        "AsciiVisualizerCfg.ascii_cli_path (e.g. /path/to/ascii_renderer/bin/ascii-cli.mjs)."
+    )
+
+
+def _ascii_cli_consumer_cmd(render_w: int, render_h: int) -> str:
+    """Best-effort consumer command string for log messages."""
+    cli = shutil.which("ascii-cli") or shutil.which("ascii-cli.mjs") or "/path/to/ascii-cli.mjs"
+    return f"{cli} --raw-in {render_w}x{render_h}"
+
+
+class _InlineTransport(_Transport):
+    """Spawn ascii-cli as a child process and feed its stdin. Subprocess stdout
+    is inherited from the parent Python process."""
+
+    def __init__(self, ascii_cli_path: str, sample_res: int, color_mode: str, bg: str):
+        self._cli_path = _resolve_ascii_cli(ascii_cli_path)
+        self._sample_res = int(sample_res)
+        self._color_mode = color_mode
+        self._bg = bg
+        self._proc: subprocess.Popen | None = None
+
+    def start(self, render_w: int, render_h: int) -> None:
+        cmd = [
+            self._cli_path,
+            "--raw-in", f"{render_w}x{render_h}",
+            "--sample-res", str(self._sample_res),
+            "--mode", self._color_mode,
+            "--bg", self._bg,
+        ]
+        if self._cli_path.endswith(".mjs") and not os.access(self._cli_path, os.X_OK):
+            cmd = ["node", *cmd]
+        logger.info("[ViewerAscii] inline transport: spawning %s", " ".join(cmd))
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+
+    def write(self, rgba: bytes) -> None:
+        if self._proc is None or self._proc.stdin is None:
+            return
+        try:
+            self._proc.stdin.write(rgba)
+            self._proc.stdin.flush()
+        except BrokenPipeError:
+            logger.warning("[ViewerAscii] ascii-cli pipe closed; stopping.")
+            self._proc = None
+
+    def close(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            self._proc.terminate()
+        self._proc = None
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+
+class _FifoTransport(_Transport):
+    """Write RGBA frames to a named pipe. Consumer attaches via ``cat <fifo> | ascii-cli``."""
+
+    def __init__(self, fifo_path: str | None):
+        self._path = fifo_path
+        self._fd: int | None = None
+        self._frame_size = 0
+        self._open_failed_logged = False
+
+    def start(self, render_w: int, render_h: int) -> None:
+        if self._path is None:
+            self._path = f"/tmp/isaac-ascii-{os.getpid()}.fifo"
+        # Recreate atomically so a crash'd previous run doesn't collide.
+        if os.path.exists(self._path):
+            try:
+                os.unlink(self._path)
+            except OSError as exc:
+                logger.warning("[ViewerAscii] could not remove stale FIFO %s: %s", self._path, exc)
+        os.mkfifo(self._path, 0o600)
+        self._frame_size = render_w * render_h * 4
+        logger.info(
+            "[ViewerAscii] fifo transport ready at %s. In another terminal, run:\n  cat %s | %s",
+            self._path, self._path, _ascii_cli_consumer_cmd(render_w, render_h),
+        )
+
+    def _ensure_fd(self) -> bool:
+        if self._fd is not None:
+            return True
+        if self._path is None:
+            return False
+        try:
+            self._fd = os.open(self._path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                # No reader attached yet. Expected during startup / between sessions.
+                if not self._open_failed_logged:
+                    logger.debug("[ViewerAscii] FIFO has no reader yet; dropping frames.")
+                    self._open_failed_logged = True
+                return False
+            raise
+        # Enlarge pipe buffer so full-frame writes are atomic and don't partial-write.
+        try:
+            import fcntl
+            fcntl.fcntl(self._fd, _F_SETPIPE_SZ, max(65536, self._frame_size * 2))
+        except (OSError, ImportError):
+            pass  # not fatal; just may lead to partial writes under load
+        # Switch to blocking writes so individual frame writes are atomic.
+        os.set_blocking(self._fd, True)
+        self._open_failed_logged = False
+        logger.info("[ViewerAscii] FIFO reader attached; streaming frames.")
+        return True
+
+    def write(self, rgba: bytes) -> None:
+        if not self._ensure_fd():
+            return
+        try:
+            n = os.write(self._fd, rgba)
+            if n != len(rgba):
+                logger.warning("[ViewerAscii] fifo partial write %d/%d (frame dropped)", n, len(rgba))
+        except BrokenPipeError:
+            # Consumer disconnected.
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def close(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        if self._path and os.path.exists(self._path):
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+
+    def is_alive(self) -> bool:
+        return True  # a fifo with no reader is still live; we just drop frames
+
+
+class _TcpTransport(_Transport):
+    """Listen on TCP; stream RGBA to the most recently connected client."""
+
+    def __init__(self, host: str, port: int):
+        self._host = host
+        self._port = int(port)
+        self._listener: socket.socket | None = None
+        self._client: socket.socket | None = None
+
+    def start(self, render_w: int, render_h: int) -> None:
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((self._host, self._port))
+        self._listener.listen(1)
+        self._listener.setblocking(False)
+        actual_port = self._listener.getsockname()[1]
+        self._port = actual_port
+        logger.info(
+            "[ViewerAscii] tcp transport listening on %s:%d. In another terminal, run:\n  nc %s %d | %s",
+            self._host, actual_port, self._host, actual_port, _ascii_cli_consumer_cmd(render_w, render_h),
+        )
+
+    def _poll_new_client(self) -> None:
+        if self._listener is None:
+            return
+        try:
+            conn, addr = self._listener.accept()
+        except BlockingIOError:
+            return
+        logger.info("[ViewerAscii] TCP client connected from %s:%d", *addr)
+        if self._client is not None:
+            try:
+                self._client.close()
+            except OSError:
+                pass
+        conn.setblocking(True)
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except OSError:
+            pass
+        self._client = conn
+
+    def write(self, rgba: bytes) -> None:
+        self._poll_new_client()
+        if self._client is None:
+            return
+        try:
+            self._client.sendall(rgba)
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            logger.info("[ViewerAscii] TCP client disconnected: %s", exc)
+            try:
+                self._client.close()
+            except OSError:
+                pass
+            self._client = None
+
+    def close(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except OSError:
+                pass
+            self._client = None
+        if self._listener is not None:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+            self._listener = None
+
+    def is_alive(self) -> bool:
+        return self._listener is not None
+
+
 class ViewerAscii(ViewerBase):
     """Newton viewer that rasterizes to RGBA and pipes to ``ascii-cli --raw-in``."""
 
     def __init__(
         self,
+        output_mode: str = "fifo",
         ascii_cli_path: str = "ascii-cli",
+        fifo_path: str | None = None,
+        tcp_host: str = "127.0.0.1",
+        tcp_port: int = 5555,
         render_width: int = 320,
         render_height: int = 200,
         sample_res: int = 8,
@@ -239,12 +501,8 @@ class ViewerAscii(ViewerBase):
         camera_target: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ):
         super().__init__()
-        self._cli_path = self._resolve_cli(ascii_cli_path)
         self._render_w = int(render_width)
         self._render_h = int(render_height)
-        self._sample_res = int(sample_res)
-        self._color_mode = color_mode
-        self._bg = bg
         self._fov = float(fov_deg)
         self._near = float(near)
         self._far = float(far)
@@ -265,56 +523,32 @@ class ViewerAscii(ViewerBase):
         self._meshes: dict[str, dict[str, np.ndarray]] = {}
         self._instance_batches: dict[str, dict[str, Any]] = {}
 
-        self._proc: subprocess.Popen | None = None
+        self._transport = self._make_transport(
+            output_mode, ascii_cli_path, sample_res, color_mode, bg, fifo_path, tcp_host, tcp_port
+        )
         self._closed = False
-        self._start_subprocess()
+        self._transport.start(self._render_w, self._render_h)
         atexit.register(self.close)
 
     @staticmethod
-    def _resolve_cli(path: str) -> str:
-        """Resolve ``ascii-cli`` path: absolute path, bare name on PATH, or the
-        known Node script name."""
-        # Absolute/explicit path.
-        if "/" in path or path.endswith(".mjs"):
-            return path
-        found = shutil.which(path)
-        if found:
-            return found
-        # Some users install by filename; try the mjs variant too.
-        for candidate in (f"{path}.mjs", "ascii-cli.mjs"):
-            found = shutil.which(candidate)
-            if found:
-                return found
-        raise FileNotFoundError(
-            f"Could not locate ascii-cli executable '{path}'. Pass an absolute path via "
-            "AsciiVisualizerCfg.ascii_cli_path (e.g. /path/to/ascii_renderer/bin/ascii-cli.mjs)."
-        )
-
-    def _start_subprocess(self) -> None:
-        """Spawn ``ascii-cli --raw-in WxH`` with stdout inherited (ANSI lands in
-        the parent terminal). stdin is where we feed RGBA bytes."""
-        cmd = [
-            self._cli_path,
-            "--raw-in",
-            f"{self._render_w}x{self._render_h}",
-            "--sample-res",
-            str(self._sample_res),
-            "--mode",
-            self._color_mode,
-            "--bg",
-            self._bg,
-        ]
-        # If the path ends in .mjs and is not executable, prefix with node.
-        if self._cli_path.endswith(".mjs"):
-            import os
-
-            if not os.access(self._cli_path, os.X_OK):
-                cmd = ["node", *cmd]
-        logger.info("[ViewerAscii] spawning %s", " ".join(cmd))
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            bufsize=0,  # unbuffered; we flush per frame
+    def _make_transport(
+        output_mode: str,
+        ascii_cli_path: str,
+        sample_res: int,
+        color_mode: str,
+        bg: str,
+        fifo_path: str | None,
+        tcp_host: str,
+        tcp_port: int,
+    ) -> _Transport:
+        if output_mode == "inline":
+            return _InlineTransport(ascii_cli_path, sample_res, color_mode, bg)
+        if output_mode == "fifo":
+            return _FifoTransport(fifo_path)
+        if output_mode == "tcp":
+            return _TcpTransport(tcp_host, tcp_port)
+        raise ValueError(
+            f"Unknown output_mode '{output_mode}'. Valid: 'inline', 'fifo', 'tcp'."
         )
 
     # --- ViewerBase abstract overrides ---
@@ -425,23 +659,16 @@ class ViewerAscii(ViewerBase):
         return np.concatenate(tris, axis=0), np.concatenate(col_out, axis=0)
 
     def _write_frame(self, rgba: np.ndarray) -> None:
-        if self._proc is None or self._proc.stdin is None:
+        if self._closed:
             return
-        try:
-            self._proc.stdin.write(rgba.tobytes())
-            self._proc.stdin.flush()
-        except BrokenPipeError:
-            logger.warning("[ViewerAscii] ascii-cli pipe closed; marking viewer as stopped.")
-            self._closed = True
+        self._transport.write(rgba.tobytes())
 
     # --- other overrides (mostly no-ops for MVP) ---
 
     def is_running(self) -> bool:
         if self._closed:
             return False
-        if self._proc is None:
-            return False
-        return self._proc.poll() is None
+        return self._transport.is_alive()
 
     def log_lines(self, name, starts, ends, colors, width: float = 0.01, hidden: bool = False) -> None:
         pass
@@ -462,17 +689,10 @@ class ViewerAscii(ViewerBase):
         if self._closed:
             return
         self._closed = True
-        if self._proc is not None:
-            try:
-                if self._proc.stdin is not None:
-                    self._proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                self._proc.terminate()
-            self._proc = None
+        try:
+            self._transport.close()
+        except Exception as exc:
+            logger.warning("[ViewerAscii] transport close error: %s", exc)
 
     # --- camera helpers ---
 
