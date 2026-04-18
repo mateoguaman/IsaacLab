@@ -37,7 +37,7 @@ from .spawners import DomeLightCfg, GroundPlaneCfg
 logger = logging.getLogger(__name__)
 
 # Visualizer type names (CLI and config). App launcher parses CSV and stores as a space-separated setting.
-_VISUALIZER_TYPES = ("newton", "rerun", "viser", "kit")
+_VISUALIZER_TYPES = ("newton", "rerun", "viser", "kit", "ascii")
 
 
 class SettingsHelper:
@@ -366,6 +366,7 @@ class SimulationContext:
             "newton": "NewtonVisualizerCfg",
             "rerun": "RerunVisualizerCfg",
             "viser": "ViserVisualizerCfg",
+            "ascii": "AsciiVisualizerCfg",
         }
         for viz_type in requested_visualizers:
             try:
@@ -848,7 +849,7 @@ def build_simulation_context(
         add_lighting: Whether to add a dome light. Defaults to False.
         auto_add_lighting: Whether to auto-add lighting if GUI present. Defaults to False.
         visualizers: List of visualizer backend keys to enable (e.g. ``["kit", "newton", "rerun"]``).
-            Valid types: ``"kit"``, ``"newton"``, ``"rerun"``, ``"viser"``.
+            Valid types: ``"kit"``, ``"newton"``, ``"rerun"``, ``"viser"``, ``"ascii"``.
             When provided, sets the ``/isaaclab/visualizer/types`` setting so the
             existing visualizer resolution machinery picks them up. Defaults to None.
 

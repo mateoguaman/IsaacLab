@@ -44,6 +44,7 @@ _VISUALIZER_REQUIREMENTS: dict[str, SceneDataRequirement] = {
     "newton": SceneDataRequirement(requires_newton_model=True),
     "rerun": SceneDataRequirement(requires_newton_model=True),
     "viser": SceneDataRequirement(requires_newton_model=True),
+    "ascii": SceneDataRequirement(requires_newton_model=True),
 }
 
 _RENDERER_REQUIREMENTS: dict[str, SceneDataRequirement] = {

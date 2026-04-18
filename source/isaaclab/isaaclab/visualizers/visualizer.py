@@ -12,7 +12,7 @@ from isaaclab.utils.backend_utils import FactoryBase
 from .base_visualizer import BaseVisualizer
 
 # Visualizer types; each loads from isaaclab_visualizers.<type> for minimal deps.
-_VISUALIZER_TYPES = ("kit", "newton", "rerun", "viser")
+_VISUALIZER_TYPES = ("kit", "newton", "rerun", "viser", "ascii")
 
 
 class Visualizer(FactoryBase, BaseVisualizer):
@@ -23,6 +23,7 @@ class Visualizer(FactoryBase, BaseVisualizer):
         "newton": "NewtonVisualizer",
         "rerun": "RerunVisualizer",
         "viser": "ViserVisualizer",
+        "ascii": "AsciiVisualizer",
     }
 
     @classmethod
