@@ -29,6 +29,12 @@ EXTRAS_REQUIRE = {
         "newton @ git+https://github.com/newton-physics/newton.git@2684d75bfa4bb8b058a93b81c458a74b7701c997",
         "viser>=1.0.16",
     ],
+    "ascii": [
+        "newton @ git+https://github.com/newton-physics/newton.git@2684d75bfa4bb8b058a93b81c458a74b7701c997",
+        # ascii-cli (Node) is a runtime dep fetched separately from
+        # https://github.com/mateoguaman/ascii_renderer; only numpy + newton are
+        # Python side.
+    ],
 }
 
 EXTRAS_REQUIRE["all"] = sorted({dep for group in EXTRAS_REQUIRE.values() for dep in group})
@@ -39,7 +45,7 @@ setup(
     maintainer="Isaac Lab Project Developers",
     url="https://github.com/isaac-sim/IsaacLab",
     version="0.1.0",
-    description="Visualizer backends for Isaac Lab (Kit, Newton, Rerun, Viser).",
+    description="Visualizer backends for Isaac Lab (Kit, Newton, Rerun, Viser, Ascii).",
     keywords=["robotics", "simulation", "visualization"],
     license="BSD-3-Clause",
     include_package_data=True,
