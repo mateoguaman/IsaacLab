@@ -70,8 +70,17 @@ def main() -> int:
     ap.add_argument(
         "--ascii-cli",
         default="ascii-cli",
-        help="Path or command name of ascii-cli (the Node.js CLI).",
+        help="Path or command name of ascii-cli (the Node.js CLI). Used only with --output-mode=inline.",
     )
+    ap.add_argument(
+        "--output-mode",
+        default="inline",
+        choices=("inline", "fifo", "tcp"),
+        help="Transport for RGBA frames. 'inline' spawns ascii-cli locally (default for this demo).",
+    )
+    ap.add_argument("--fifo-path", default=None, help="Override auto-generated FIFO path.")
+    ap.add_argument("--tcp-host", default="127.0.0.1")
+    ap.add_argument("--tcp-port", type=int, default=5555)
     ap.add_argument("--frames", type=int, default=240)
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--render-size", default="320x200", help="Offscreen RGBA size (WxH).")
@@ -83,7 +92,11 @@ def main() -> int:
     render_w, render_h = map(int, args.render_size.split("x"))
 
     viewer = ViewerAscii(
+        output_mode=args.output_mode,
         ascii_cli_path=args.ascii_cli,
+        fifo_path=args.fifo_path,
+        tcp_host=args.tcp_host,
+        tcp_port=args.tcp_port,
         render_width=render_w,
         render_height=render_h,
         sample_res=args.sample_res,
