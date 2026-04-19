@@ -427,18 +427,65 @@ class SimulationContext:
         return True, max_worlds
 
     def _apply_visualizer_cli_overrides(self, visualizer_cfgs: list[Any]) -> None:
-        """Apply CLI visualizer overrides (e.g., max worlds) to resolved configs.
+        """Apply CLI visualizer overrides (max worlds, ascii transport) to resolved configs.
 
         Args:
             visualizer_cfgs: Resolved visualizer configs to update in-place.
         """
         has_max_worlds_override, max_worlds_override = self._get_cli_visualizer_max_worlds_override()
-        if not has_max_worlds_override:
-            return
+        if has_max_worlds_override:
+            for cfg in visualizer_cfgs:
+                if hasattr(cfg, "max_worlds"):
+                    cfg.max_worlds = max_worlds_override
 
-        for cfg in visualizer_cfgs:
-            if hasattr(cfg, "max_worlds"):
-                cfg.max_worlds = max_worlds_override
+        ascii_override = self._get_cli_ascii_output_override()
+        if ascii_override is not None:
+            for cfg in visualizer_cfgs:
+                if getattr(cfg, "visualizer_type", None) != "ascii":
+                    continue
+                mode, fifo_path, tcp_host, tcp_port = ascii_override
+                cfg.output_mode = mode
+                if fifo_path is not None:
+                    cfg.fifo_path = fifo_path
+                if tcp_host is not None:
+                    cfg.tcp_host = tcp_host
+                if tcp_port is not None:
+                    cfg.tcp_port = tcp_port
+
+    def _get_cli_ascii_output_override(self) -> tuple[str, str | None, str | None, int | None] | None:
+        """Parse ``/isaaclab/visualizer/ascii_output`` setting.
+
+        Returns:
+            ``(mode, fifo_path, tcp_host, tcp_port)`` tuple, or ``None`` when no
+            override was provided. Unset fields are ``None``.
+        """
+        raw = self.get_setting("/isaaclab/visualizer/ascii_output")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        value = raw.strip()
+        head, _, tail = value.partition(":")
+        mode = head.lower()
+        if mode not in {"inline", "fifo", "tcp"}:
+            logger.warning("[SimulationContext] Invalid --ascii_output mode %r; ignoring.", raw)
+            return None
+        if mode == "inline":
+            if tail:
+                logger.warning("[SimulationContext] --ascii_output 'inline' takes no argument; ignoring %r.", tail)
+            return ("inline", None, None, None)
+        if mode == "fifo":
+            return ("fifo", tail or None, None, None)
+        # mode == "tcp"
+        if not tail:
+            return ("tcp", None, None, None)
+        host_part, sep, port_part = tail.rpartition(":")
+        # "tcp:PORT" → no sep, "tcp:HOST:PORT" → sep exists
+        try:
+            port = int(port_part) if port_part else None
+        except ValueError:
+            logger.warning("[SimulationContext] --ascii_output port %r not an int; ignoring.", port_part)
+            return None
+        host = host_part if sep else None
+        return ("tcp", None, host, port)
 
     def _is_cli_visualizer_explicit(self) -> bool:
         """Return ``True`` when visualizers were explicitly provided via CLI."""

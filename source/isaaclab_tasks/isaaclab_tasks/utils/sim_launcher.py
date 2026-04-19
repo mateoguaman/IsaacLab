@@ -223,6 +223,14 @@ def launch_simulation(
         settings.set_string("/isaaclab/visualizer/types", visualizer_str)
         settings.set_bool("/isaaclab/visualizer/explicit", True)
         settings.set_bool("/isaaclab/visualizer/disable_all", disable_all)
+        # Forward optional ascii transport override so AsciiVisualizerCfg can be
+        # overridden without running AppLauncher (Kit-less Newton path).
+        ascii_output = None
+        if isinstance(launcher_args, argparse.Namespace):
+            ascii_output = getattr(launcher_args, "ascii_output", None)
+        elif isinstance(launcher_args, dict):
+            ascii_output = launcher_args.get("ascii_output")
+        settings.set_string("/isaaclab/visualizer/ascii_output", ascii_output or "")
 
     try:
         yield

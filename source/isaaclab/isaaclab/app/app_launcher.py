@@ -492,6 +492,21 @@ class AppLauncher:
                 "If omitted, visualizer config defaults are used."
             ),
         )
+        arg_group.add_argument(
+            "--ascii_output",
+            type=str,
+            default=AppLauncher._APPLAUNCHER_CFG_INFO["ascii_output"][1],
+            help=(
+                "Transport override for the ASCII visualizer. URI-style string parsed as follows:"
+                "  'fifo'            -> FIFO mode, auto path /tmp/isaac-ascii-<pid>.fifo;"
+                "  'fifo:/some/path' -> FIFO mode at the given path;"
+                "  'tcp'             -> TCP on 127.0.0.1:5555;"
+                "  'tcp:PORT'        -> TCP on 127.0.0.1:PORT (PORT=0 picks ephemeral);"
+                "  'tcp:HOST:PORT'   -> TCP bound to HOST:PORT;"
+                "  'inline'          -> spawn ascii-cli and feed its stdin (interactive demos only)."
+                " Ignored when no ASCII visualizer is active."
+            ),
+        )
         # special flag for backwards compatibility
 
         # Corresponding to the beginning of the function,
@@ -513,6 +528,7 @@ class AppLauncher:
         "experience": ([str], ""),
         "rendering_mode": ([str], "balanced"),
         "visualizer_max_worlds": ([int, type(None)], None),
+        "ascii_output": ([str, type(None)], None),
     }
     """A dictionary of arguments added manually by the :meth:`AppLauncher.add_app_launcher_args` method.
 
@@ -1170,6 +1186,10 @@ class AppLauncher:
                 settings.set_int("/isaaclab/visualizer/max_worlds", -1)
             else:
                 settings.set_int("/isaaclab/visualizer/max_worlds", int(visualizer_max_worlds))
+            # Optional override for AsciiVisualizerCfg transport (fifo / tcp / inline).
+            # Stored as a raw string; parsed and applied in SimulationContext.
+            ascii_output = launcher_args.get("ascii_output")
+            settings.set_string("/isaaclab/visualizer/ascii_output", ascii_output or "")
 
     def _interrupt_signal_handle_callback(self, signal, frame):
         """Handle the interrupt signal from the keyboard."""
