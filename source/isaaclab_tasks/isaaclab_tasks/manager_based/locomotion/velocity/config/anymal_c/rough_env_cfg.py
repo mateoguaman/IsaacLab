@@ -3,6 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+from isaaclab_physx.physics import PhysxCfg
+
+from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
@@ -31,8 +35,26 @@ class AnymalCEventsCfg(PresetCfg):
 
 
 @configclass
+class AnymalCRoughPhysicsCfg(PresetCfg):
+    default = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+    newton = NewtonCfg(
+        solver_cfg=MJWarpSolverCfg(
+            njmax=120,
+            nconmax=15,
+            cone="elliptic",
+            impratio=100,
+            integrator="implicitfast",
+        ),
+        num_substeps=1,
+        debug_mode=False,
+    )
+    physx = default
+
+
+@configclass
 class AnymalCRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     events: AnymalCEventsCfg = AnymalCEventsCfg()
+    sim: SimulationCfg = SimulationCfg(physics=AnymalCRoughPhysicsCfg())
 
     def __post_init__(self):
         # post init of parent

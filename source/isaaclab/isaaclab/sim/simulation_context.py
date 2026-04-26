@@ -439,18 +439,36 @@ class SimulationContext:
                     cfg.max_worlds = max_worlds_override
 
         ascii_override = self._get_cli_ascii_output_override()
-        if ascii_override is not None:
-            for cfg in visualizer_cfgs:
-                if getattr(cfg, "visualizer_type", None) != "ascii":
-                    continue
-                mode, fifo_path, tcp_host, tcp_port = ascii_override
-                cfg.output_mode = mode
-                if fifo_path is not None:
-                    cfg.fifo_path = fifo_path
-                if tcp_host is not None:
-                    cfg.tcp_host = tcp_host
-                if tcp_port is not None:
-                    cfg.tcp_port = tcp_port
+        ascii_camera_pos = self._get_cli_ascii_camera_override("/isaaclab/visualizer/ascii_camera_pos")
+        ascii_camera_target = self._get_cli_ascii_camera_override("/isaaclab/visualizer/ascii_camera_target")
+        ascii_resolution = self._get_cli_ascii_resolution_override()
+        ascii_sample_res = self._get_cli_ascii_sample_res_override()
+        viser_log_camera = bool(self.get_setting("/isaaclab/visualizer/viser_log_camera"))
+        for cfg in visualizer_cfgs:
+            viz_type = getattr(cfg, "visualizer_type", None)
+            if viz_type == "ascii":
+                if ascii_override is not None:
+                    mode, fifo_path, tcp_host, tcp_port = ascii_override
+                    cfg.output_mode = mode
+                    if fifo_path is not None:
+                        cfg.fifo_path = fifo_path
+                    if tcp_host is not None:
+                        cfg.tcp_host = tcp_host
+                    if tcp_port is not None:
+                        cfg.tcp_port = tcp_port
+                if ascii_camera_pos is not None:
+                    cfg.camera_position = ascii_camera_pos
+                    cfg.camera_source = "cfg"
+                if ascii_camera_target is not None:
+                    cfg.camera_target = ascii_camera_target
+                    cfg.camera_source = "cfg"
+                if ascii_resolution is not None:
+                    cfg.render_width, cfg.render_height = ascii_resolution
+                if ascii_sample_res is not None:
+                    cfg.sample_res = ascii_sample_res
+            elif viz_type == "viser":
+                if viser_log_camera and hasattr(cfg, "log_camera_pose"):
+                    cfg.log_camera_pose = True
 
     def _get_cli_ascii_output_override(self) -> tuple[str, str | None, str | None, int | None] | None:
         """Parse ``/isaaclab/visualizer/ascii_output`` setting.
@@ -486,6 +504,55 @@ class SimulationContext:
             return None
         host = host_part if sep else None
         return ("tcp", None, host, port)
+
+    def _get_cli_ascii_camera_override(self, setting_path: str) -> tuple[float, float, float] | None:
+        """Parse a ``"x,y,z"`` camera setting into a 3-tuple, or ``None`` when unset."""
+        raw = self.get_setting(setting_path)
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) != 3:
+            logger.warning("[SimulationContext] %s expected 'x,y,z'; got %r. Ignoring.", setting_path, raw)
+            return None
+        try:
+            return (float(parts[0]), float(parts[1]), float(parts[2]))
+        except ValueError:
+            logger.warning("[SimulationContext] %s has non-numeric values %r. Ignoring.", setting_path, raw)
+            return None
+
+    def _get_cli_ascii_resolution_override(self) -> tuple[int, int] | None:
+        """Parse ``/isaaclab/visualizer/ascii_resolution`` as ``"WxH"`` into (width, height)."""
+        raw = self.get_setting("/isaaclab/visualizer/ascii_resolution")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        value = raw.strip().lower().replace("X", "x")
+        w_str, sep, h_str = value.partition("x")
+        if not sep:
+            logger.warning("[SimulationContext] --ascii_resolution expected 'WxH'; got %r. Ignoring.", raw)
+            return None
+        try:
+            width, height = int(w_str), int(h_str)
+        except ValueError:
+            logger.warning("[SimulationContext] --ascii_resolution has non-integer dims %r. Ignoring.", raw)
+            return None
+        if width <= 0 or height <= 0:
+            logger.warning("[SimulationContext] --ascii_resolution must be positive; got %r. Ignoring.", raw)
+            return None
+        return width, height
+
+    def _get_cli_ascii_sample_res_override(self) -> int | None:
+        """Parse ``/isaaclab/visualizer/ascii_sample_res``; -1 means "no override"."""
+        value = self.get_setting("/isaaclab/visualizer/ascii_sample_res")
+        if value is None:
+            return None
+        try:
+            sample_res = int(value)
+        except (TypeError, ValueError):
+            logger.warning("[SimulationContext] /isaaclab/visualizer/ascii_sample_res invalid: %r", value)
+            return None
+        if sample_res < 1:
+            return None
+        return sample_res
 
     def _is_cli_visualizer_explicit(self) -> bool:
         """Return ``True`` when visualizers were explicitly provided via CLI."""

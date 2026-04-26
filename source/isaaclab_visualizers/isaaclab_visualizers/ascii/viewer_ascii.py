@@ -22,12 +22,17 @@ import os
 import shutil
 import socket
 import subprocess
+import time
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
+import warp as wp
 
 import newton
 from newton._src.viewer.viewer import ViewerBase
+
+from .warp_rasterizer import WarpRasterizer
 
 logger = logging.getLogger(__name__)
 
@@ -49,20 +54,6 @@ def _to_numpy(arr: Any) -> np.ndarray | None:
         except Exception:
             pass
     return np.asarray(arr)
-
-
-def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate vectors ``v`` (..., 3) by unit quaternions ``q`` (..., 4) in xyzw order."""
-    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    vx, vy, vz = v[..., 0], v[..., 1], v[..., 2]
-    # v' = v + 2 * q_xyz × (q_xyz × v + w v)
-    tx = 2.0 * (y * vz - z * vy)
-    ty = 2.0 * (z * vx - x * vz)
-    tz = 2.0 * (x * vy - y * vx)
-    rx = vx + w * tx + (y * tz - z * ty)
-    ry = vy + w * ty + (z * tx - x * tz)
-    rz = vz + w * tz + (x * ty - y * tx)
-    return np.stack([rx, ry, rz], axis=-1)
 
 
 def _look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
@@ -94,134 +85,76 @@ def _perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np
     return m
 
 
-class NumpyRasterizer:
-    """Small software rasterizer: z-buffered flat-shaded triangles in numpy."""
+class _AsciiPerfMeter:
+    """Lightweight stage timer gated by ``ISAACLAB_ASCII_PROFILE`` env var.
 
-    def __init__(
-        self,
-        width: int,
-        height: int,
-        bg_color: tuple[int, int, int] = (8, 10, 14),
-        ambient: float = 0.25,
-        light_dir: tuple[float, float, float] = (-0.4, -0.6, -0.7),
-    ):
-        self.width = int(width)
-        self.height = int(height)
-        self.bg_color = np.array(bg_color, dtype=np.float32)
-        self.ambient = float(ambient)
-        light = np.array(light_dir, dtype=np.float32)
-        norm = np.linalg.norm(light)
-        self.light_dir = light / norm if norm > 1e-9 else np.array([0, 0, -1], dtype=np.float32)
-        self._color_buf: np.ndarray | None = None
-        self._depth_buf: np.ndarray | None = None
+    Accumulates per-stage wall time across frames and periodically logs the
+    mean per-frame cost of each stage plus an overall frame rate. When
+    disabled the ``stage()`` context manager is a no-op so steady-state
+    overhead is a single env-var check per call."""
 
-    def clear(self) -> None:
-        self._color_buf = np.broadcast_to(self.bg_color, (self.height, self.width, 3)).copy()
-        self._depth_buf = np.full((self.height, self.width), np.inf, dtype=np.float32)
+    def __init__(self, period: int = 60):
+        env_period = os.environ.get("ISAACLAB_ASCII_PROFILE_PERIOD", "").strip()
+        if env_period:
+            try:
+                period = max(1, int(env_period))
+            except ValueError:
+                pass
+        self._period = max(1, int(period))
+        self._sums: dict[str, float] = {}
+        self._counts: dict[str, int] = {}
+        self._extras: dict[str, list[float]] = {}
+        self._n_frames = 0
+        self._last_wall: float | None = None
+        flag = os.environ.get("ISAACLAB_ASCII_PROFILE", "").strip().lower()
+        self._enabled = flag in ("1", "true", "yes", "on")
 
-    def rgba(self) -> np.ndarray:
-        assert self._color_buf is not None
-        rgba = np.empty((self.height, self.width, 4), dtype=np.uint8)
-        rgba[..., :3] = np.clip(self._color_buf, 0, 255).astype(np.uint8)
-        rgba[..., 3] = 255
-        return rgba
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
 
-    def draw_triangles(
-        self,
-        world_tris: np.ndarray,
-        base_colors: np.ndarray,
-        view: np.ndarray,
-        proj: np.ndarray,
-    ) -> None:
-        """Rasterize a batch of world-space triangles.
-
-        Args:
-            world_tris: (N, 3, 3) vertex positions in world space.
-            base_colors: (N, 3) RGB in [0, 1].
-            view: 4x4 view matrix.
-            proj: 4x4 projection matrix.
-        """
-        if world_tris.size == 0:
+    @contextmanager
+    def stage(self, name: str):
+        if not self._enabled:
+            yield
             return
-        assert self._color_buf is not None and self._depth_buf is not None
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt = time.perf_counter() - t0
+            self._sums[name] = self._sums.get(name, 0.0) + dt
+            self._counts[name] = self._counts.get(name, 0) + 1
 
-        n_tris = world_tris.shape[0]
-        # World-space face normals for lighting.
-        edge1 = world_tris[:, 1] - world_tris[:, 0]
-        edge2 = world_tris[:, 2] - world_tris[:, 0]
-        normals = np.cross(edge1, edge2)
-        norms = np.linalg.norm(normals, axis=1, keepdims=True)
-        normals = np.where(norms > 1e-9, normals / np.maximum(norms, 1e-9), np.array([0, 0, 1.0]))
-
-        # Flat shading: Lambertian with -light_dir as the incoming direction.
-        lambert = np.clip(normals @ (-self.light_dir), 0.0, 1.0)  # (N,)
-        shade = self.ambient + (1.0 - self.ambient) * lambert  # (N,)
-        lit = base_colors * shade[:, None] * 255.0  # (N, 3) in [0, 255]
-
-        # World → clip.
-        verts_h = np.concatenate([world_tris.reshape(-1, 3), np.ones((n_tris * 3, 1), dtype=np.float32)], axis=1)
-        clip = verts_h @ (proj @ view).T  # (3N, 4)
-        w = clip[:, 3:4]
-        # Skip triangles with any vertex behind the near plane (simple cull).
-        w3 = w.reshape(n_tris, 3)
-        front = np.all(w3 > 1e-4, axis=1)
-        if not np.any(front):
+    def record(self, name: str, value: float) -> None:
+        if not self._enabled:
             return
-        ndc = clip[:, :3] / np.maximum(np.abs(w), 1e-9) * np.sign(w)
-        ndc = ndc.reshape(n_tris, 3, 3)  # (N, 3 verts, xyz)
+        self._extras.setdefault(name, []).append(float(value))
 
-        # NDC → screen (pixel center at integer coord).
-        sx = (ndc[..., 0] + 1.0) * 0.5 * (self.width - 1)
-        sy = (1.0 - ndc[..., 1]) * 0.5 * (self.height - 1)
-        sz = ndc[..., 2]  # depth in [-1, 1]
-
-        for i in np.flatnonzero(front):
-            self._raster_one(sx[i], sy[i], sz[i], lit[i])
-
-    def _raster_one(self, sx: np.ndarray, sy: np.ndarray, sz: np.ndarray, color: np.ndarray) -> None:
-        # Screen-space bbox.
-        x_min = max(int(math.floor(sx.min())), 0)
-        x_max = min(int(math.ceil(sx.max())), self.width - 1)
-        y_min = max(int(math.floor(sy.min())), 0)
-        y_max = min(int(math.ceil(sy.max())), self.height - 1)
-        if x_min > x_max or y_min > y_max:
+    def tick(self) -> None:
+        if not self._enabled:
             return
-
-        (x0, y0), (x1, y1), (x2, y2) = zip(sx, sy)
-        area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
-        if abs(area) < 1e-6:
+        self._n_frames += 1
+        if self._n_frames % self._period:
             return
-        # Consistent winding: fold so area > 0 and remember flip for culling.
-        if area < 0:
-            x1, x2 = x2, x1
-            y1, y2 = y2, y1
-            sz = sz[[0, 2, 1]]
-            area = -area
-
-        xs = np.arange(x_min, x_max + 1, dtype=np.float32)
-        ys = np.arange(y_min, y_max + 1, dtype=np.float32)
-        gx, gy = np.meshgrid(xs, ys)
-
-        w0 = (x1 - gx) * (y2 - gy) - (y1 - gy) * (x2 - gx)
-        w1 = (x2 - gx) * (y0 - gy) - (y2 - gy) * (x0 - gx)
-        w2 = (x0 - gx) * (y1 - gy) - (y0 - gy) * (x1 - gx)
-        inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
-        if not inside.any():
-            return
-
-        inv_area = 1.0 / area
-        bary0 = w0 * inv_area
-        bary1 = w1 * inv_area
-        bary2 = w2 * inv_area
-        depth = bary0 * sz[0] + bary1 * sz[1] + bary2 * sz[2]
-
-        sub_depth = self._depth_buf[y_min : y_max + 1, x_min : x_max + 1]
-        sub_color = self._color_buf[y_min : y_max + 1, x_min : x_max + 1]
-        mask = inside & (depth < sub_depth)
-        if not mask.any():
-            return
-        sub_depth[mask] = depth[mask]
-        sub_color[mask] = color
+        now = time.perf_counter()
+        parts: list[str] = []
+        if self._last_wall is not None:
+            fps = self._period / max(now - self._last_wall, 1e-9)
+            parts.append(f"fps={fps:.1f}")
+        self._last_wall = now
+        for name in sorted(self._sums):
+            mean_ms = self._sums[name] / max(self._counts[name], 1) * 1000.0
+            parts.append(f"{name}={mean_ms:.2f}ms")
+        for name in sorted(self._extras):
+            vals = self._extras[name]
+            if not vals:
+                continue
+            parts.append(f"{name}={sum(vals) / len(vals):.1f}")
+        logger.info("[ViewerAscii perf] frame=%d %s", self._n_frames, " ".join(parts))
+        self._sums.clear()
+        self._counts.clear()
+        self._extras.clear()
 
 
 class _Transport:
@@ -263,6 +196,65 @@ def _ascii_cli_consumer_cmd(render_w: int, render_h: int) -> str:
     """Best-effort consumer command string for log messages."""
     cli = shutil.which("ascii-cli") or shutil.which("ascii-cli.mjs") or "/path/to/ascii-cli.mjs"
     return f"{cli} --raw-in {render_w}x{render_h}"
+
+
+# Cell aspect ratio used by AsciiRenderer.computeGrid — cellH = sample_res * 4/3.
+# Duplicated here so the producer can report the expected terminal grid without
+# importing the JS renderer. Kept in sync manually with alphabet.metadata.
+_CELL_ASPECT = 4.0 / 3.0
+
+# Conventional install location advertised in the connection block. Users with
+# a different layout can adjust the printed path by hand; no need to make this
+# configurable until it becomes a real friction point.
+_DEFAULT_ADVERTISED_ASCII_CLI = "~/projects/ascii_renderer/bin/ascii-cli.mjs"
+
+
+def _expected_grid(render_w: int, render_h: int, sample_res: int) -> tuple[int, int]:
+    """Cols × rows the viewer terminal must be at least as large as."""
+    cols = max(1, render_w // sample_res)
+    rows = max(1, int(render_h // (sample_res * _CELL_ASPECT)))
+    return cols, rows
+
+
+def _format_viewer_ready_block(
+    host: str, port: int, render_w: int, render_h: int,
+    sample_res: int, color_mode: str, bg: str,
+) -> str:
+    """Build the multi-line 'ASCII VIEWER READY' block advertised on TCP start.
+
+    Topology-agnostic: prints only what the producer knows about itself. The
+    user supplies their own SSH target (alias, -J jumphost, etc.) via their
+    ~/.ssh/config — the command template just shows the default `ssh <host>`."""
+    cols, rows = _expected_grid(render_w, render_h, sample_res)
+    cli = _DEFAULT_ADVERTISED_ASCII_CLI
+    raw = f"{render_w}x{render_h}"
+    mode = color_mode if color_mode != "auto" else "truecolor"
+    long_cmd = (
+        f"  ssh {host} \"nc localhost {port}\" \\\n"
+        f"    | {cli} \\\n"
+        f"      --raw-in {raw} --sample-res {sample_res} --mode {mode} --bg {bg}"
+    )
+    short_cmd = f"  ascii-connect {host} {port} {raw} @{sample_res}"
+    return (
+        "\n================ ASCII VIEWER READY ================\n"
+        f"host    : {host}\n"
+        f"port    : {port}\n"
+        f"frame   : {raw} @ sample-res={sample_res}\n"
+        f"grid    : >={cols}x{rows} cells  (viewer terminal must be at least this big)\n"
+        "\n"
+        "On any machine from which you can SSH here, open a terminal, shrink the\n"
+        "font (Cmd-minus / Ctrl-minus in most terminals), and run:\n"
+        "\n"
+        f"{long_cmd}\n"
+        "\n"
+        f"If `ssh {host}` doesn't work directly, adjust the SSH target the way\n"
+        "you'd normally reach this host (aliases, `-J loginnode`, keys, etc.) —\n"
+        "only the SSH target changes; everything else stays the same.\n"
+        "\n"
+        "Shorter form if you have ascii-connect on PATH:\n"
+        f"{short_cmd}\n"
+        "====================================================\n"
+    )
 
 
 class _InlineTransport(_Transport):
@@ -404,9 +396,12 @@ class _FifoTransport(_Transport):
 class _TcpTransport(_Transport):
     """Listen on TCP; stream RGBA to the most recently connected client."""
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, sample_res: int, color_mode: str, bg: str):
         self._host = host
         self._port = int(port)
+        self._sample_res = int(sample_res)
+        self._color_mode = color_mode
+        self._bg = bg
         self._listener: socket.socket | None = None
         self._client: socket.socket | None = None
 
@@ -418,9 +413,17 @@ class _TcpTransport(_Transport):
         self._listener.setblocking(False)
         actual_port = self._listener.getsockname()[1]
         self._port = actual_port
+        # socket.gethostname() gives the advertisable name: a workstation's own
+        # name on a LAN, or a slurm compute node's internal name (e.g. g3060)
+        # that resolves via the user's ~/.ssh/config ProxyJump stanza. Falls
+        # back to the bind address if resolution fails.
+        advertised_host = socket.gethostname() or self._host
         logger.info(
-            "[ViewerAscii] tcp transport listening on %s:%d. In another terminal, run:\n  nc %s %d | %s",
-            self._host, actual_port, self._host, actual_port, _ascii_cli_consumer_cmd(render_w, render_h),
+            "%s",
+            _format_viewer_ready_block(
+                advertised_host, actual_port, render_w, render_h,
+                self._sample_res, self._color_mode, self._bg,
+            ),
         )
 
     def _poll_new_client(self) -> None:
@@ -512,7 +515,7 @@ class ViewerAscii(ViewerBase):
         # Z-up matches Newton/Isaac Lab convention; _look_at handles orthogonalization.
         self._up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
-        self._rasterizer = NumpyRasterizer(
+        self._rasterizer = WarpRasterizer(
             width=self._render_w,
             height=self._render_h,
             bg_color=background_color,
@@ -522,6 +525,12 @@ class ViewerAscii(ViewerBase):
 
         self._meshes: dict[str, dict[str, np.ndarray]] = {}
         self._instance_batches: dict[str, dict[str, Any]] = {}
+
+        self._perf = _AsciiPerfMeter(period=60)
+        if self._perf.enabled:
+            logger.info(
+                "[ViewerAscii] profiler enabled (ISAACLAB_ASCII_PROFILE); logging every 60 frames"
+            )
 
         self._transport = self._make_transport(
             output_mode, ascii_cli_path, sample_res, color_mode, bg, fifo_path, tcp_host, tcp_port
@@ -546,7 +555,7 @@ class ViewerAscii(ViewerBase):
         if output_mode == "fifo":
             return _FifoTransport(fifo_path)
         if output_mode == "tcp":
-            return _TcpTransport(tcp_host, tcp_port)
+            return _TcpTransport(tcp_host, tcp_port, sample_res, color_mode, bg)
         raise ValueError(
             f"Unknown output_mode '{output_mode}'. Valid: 'inline', 'fifo', 'tcp'."
         )
@@ -570,7 +579,13 @@ class ViewerAscii(ViewerBase):
             return
         verts = np.asarray(verts, dtype=np.float32).reshape(-1, 3)
         idx = np.asarray(idx, dtype=np.int32).reshape(-1, 3)
-        self._meshes[name] = {"vertices": verts, "indices": idx}
+        verts_wp, idx_wp = self._rasterizer.upload_mesh(verts, idx)
+        self._meshes[name] = {
+            "vertices": verts,
+            "indices": idx,
+            "verts_wp": verts_wp,
+            "idx_wp": idx_wp,
+        }
 
     def log_instances(
         self,
@@ -585,78 +600,76 @@ class ViewerAscii(ViewerBase):
         if hidden or xforms is None:
             self._instance_batches.pop(name, None)
             return
-        xforms_np = _to_numpy(xforms)
-        if xforms_np is None:
+
+        # Keep warp arrays as-is so draw_batch can consume them on GPU
+        # without a GPU→CPU→GPU roundtrip. Only numpy-like inputs are
+        # materialized to numpy here.
+        def _keep_or_numpy(arr, row_len: int):
+            if arr is None:
+                return None
+            if isinstance(arr, wp.array):
+                return arr
+            return np.asarray(_to_numpy(arr), dtype=np.float32).reshape(-1, row_len)
+
+        xforms_stored = _keep_or_numpy(xforms, 7)
+        if xforms_stored is None:
             self._instance_batches.pop(name, None)
             return
-        # Each transform is (pos.x, pos.y, pos.z, q.x, q.y, q.z, q.w).
-        xforms_np = np.asarray(xforms_np, dtype=np.float32).reshape(-1, 7)
-        scales_np = _to_numpy(scales)
-        if scales_np is not None:
-            scales_np = np.asarray(scales_np, dtype=np.float32).reshape(-1, 3)
-        colors_np = _to_numpy(colors)
-        if colors_np is not None:
-            colors_np = np.asarray(colors_np, dtype=np.float32).reshape(-1, 3)
+        scales_stored = _keep_or_numpy(scales, 3)
+        colors_stored = _keep_or_numpy(colors, 3)
         self._instance_batches[name] = {
             "mesh": mesh,
-            "xforms": xforms_np,
-            "scales": scales_np,
-            "colors": colors_np,
+            "xforms": xforms_stored,
+            "scales": scales_stored,
+            "colors": colors_stored,
         }
 
     def end_frame(self) -> None:
         if self._closed:
             return
-        self._rasterizer.clear()
+        with self._perf.stage("1_clear"):
+            self._rasterizer.clear()
 
-        view = _look_at(self._camera_pos, self._camera_target, self._up)
-        aspect = self._render_w / max(1, self._render_h)
-        proj = _perspective(self._fov, aspect, self._near, self._far)
+        with self._perf.stage("2_matrices"):
+            view = _look_at(self._camera_pos, self._camera_target, self._up)
+            aspect = self._render_w / max(1, self._render_h)
+            proj = _perspective(self._fov, aspect, self._near, self._far)
 
-        for batch in self._instance_batches.values():
-            mesh = self._meshes.get(batch["mesh"])
-            if mesh is None:
-                continue
-            xforms = batch["xforms"]
-            if xforms.shape[0] == 0:
-                continue
-            world_tris, tri_colors = self._world_triangles(mesh, batch)
-            if world_tris.size == 0:
-                continue
-            self._rasterizer.draw_triangles(world_tris, tri_colors, view, proj)
+        n_inst_total = 0
+        n_tris_total = 0
+        with self._perf.stage("3_expand_and_draw"):
+            for batch in self._instance_batches.values():
+                mesh = self._meshes.get(batch["mesh"])
+                if mesh is None:
+                    continue
+                xforms = batch["xforms"]
+                if xforms.shape[0] == 0:
+                    continue
+                n_inst = int(xforms.shape[0])
+                n_tris_per_inst = int(mesh["indices"].shape[0])
+                n_inst_total += n_inst
+                n_tris_total += n_inst * n_tris_per_inst
+                self._rasterizer.draw_batch(
+                    mesh["verts_wp"],
+                    mesh["idx_wp"],
+                    xforms,
+                    batch["scales"],
+                    batch["colors"],
+                    self._default_color,
+                    view,
+                    proj,
+                )
 
-        rgba = self._rasterizer.rgba()
-        self._write_frame(rgba)
+        self._perf.record("n_instances", n_inst_total)
+        self._perf.record("n_triangles", n_tris_total)
 
-    def _world_triangles(
-        self, mesh: dict[str, np.ndarray], batch: dict[str, Any]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Expand a (mesh, instances) pair into (N_tris, 3, 3) world vertices +
-        (N_tris, 3) RGB base colors."""
-        verts = mesh["vertices"]  # (V, 3)
-        idx = mesh["indices"]  # (T, 3)
-        xforms = batch["xforms"]  # (I, 7)
-        scales = batch["scales"]  # (I, 3) or None
-        colors = batch["colors"]  # (I, 3) or None
+        with self._perf.stage("4_rgba_pack"):
+            rgba = self._rasterizer.rgba()
 
-        n_inst = xforms.shape[0]
-        # Scale → rotate → translate for each instance.
-        tris = []
-        col_out = []
-        for i in range(n_inst):
-            s = scales[i] if scales is not None else np.array([1.0, 1.0, 1.0], dtype=np.float32)
-            t = xforms[i, 0:3]
-            q = xforms[i, 3:7]
-            scaled = verts * s[None, :]
-            rotated = _quat_rotate(np.broadcast_to(q, scaled.shape[:-1] + (4,)), scaled)
-            world = rotated + t[None, :]
-            tris.append(world[idx])
-            if colors is not None:
-                c = colors[i]
-            else:
-                c = self._default_color
-            col_out.append(np.broadcast_to(c, (idx.shape[0], 3)))
-        return np.concatenate(tris, axis=0), np.concatenate(col_out, axis=0)
+        with self._perf.stage("5_transport_write"):
+            self._write_frame(rgba)
+
+        self._perf.tick()
 
     def _write_frame(self, rgba: np.ndarray) -> None:
         if self._closed:

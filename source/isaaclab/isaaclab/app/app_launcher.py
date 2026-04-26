@@ -507,6 +507,58 @@ class AppLauncher:
                 " Ignored when no ASCII visualizer is active."
             ),
         )
+        arg_group.add_argument(
+            "--ascii_camera_pos",
+            type=str,
+            default=AppLauncher._APPLAUNCHER_CFG_INFO["ascii_camera_pos"][1],
+            help=(
+                "Camera eye position for the ASCII visualizer as 'x,y,z' (world units). "
+                "Overrides AsciiVisualizerCfg.camera_position. Useful for framing small scenes "
+                "like cartpole from a tuned pose."
+            ),
+        )
+        arg_group.add_argument(
+            "--ascii_camera_target",
+            type=str,
+            default=AppLauncher._APPLAUNCHER_CFG_INFO["ascii_camera_target"][1],
+            help=(
+                "Camera look-at target for the ASCII visualizer as 'x,y,z' (world units). "
+                "Overrides AsciiVisualizerCfg.camera_target."
+            ),
+        )
+        arg_group.add_argument(
+            "--ascii_resolution",
+            type=str,
+            default=AppLauncher._APPLAUNCHER_CFG_INFO["ascii_resolution"][1],
+            help=(
+                "Offscreen render size for the ASCII visualizer as 'WIDTHxHEIGHT' (pixels). "
+                "Overrides AsciiVisualizerCfg.render_width / render_height. Pair with "
+                "--ascii_sample_res to size the rendered grid to the consumer terminal: "
+                "cols = width / sample_res, rows = height / (sample_res * 2). "
+                "Example: 1600x800 with --ascii_sample_res 8 gives a 200x50 cell grid."
+            ),
+        )
+        arg_group.add_argument(
+            "--ascii_sample_res",
+            type=int,
+            default=AppLauncher._APPLAUNCHER_CFG_INFO["ascii_sample_res"][1],
+            help=(
+                "Sampling density in pixels per terminal cell for the ASCII visualizer. "
+                "Overrides AsciiVisualizerCfg.sample_res (and ascii-cli --sample-res when "
+                "the inline transport is used). Useful range 4-16; lower is sharper and "
+                "more cells per rendered pixel."
+            ),
+        )
+        arg_group.add_argument(
+            "--viser_log_camera",
+            action="store_true",
+            default=AppLauncher._APPLAUNCHER_CFG_INFO["viser_log_camera"][1],
+            help=(
+                "When set, the Viser visualizer periodically prints the live client "
+                "camera pose to stdout as ready-to-copy '--ascii_camera_pos/target' "
+                "arguments. Useful for tuning the ASCII camera to match viser."
+            ),
+        )
         # special flag for backwards compatibility
 
         # Corresponding to the beginning of the function,
@@ -529,6 +581,11 @@ class AppLauncher:
         "rendering_mode": ([str], "balanced"),
         "visualizer_max_worlds": ([int, type(None)], None),
         "ascii_output": ([str, type(None)], None),
+        "ascii_camera_pos": ([str, type(None)], None),
+        "ascii_camera_target": ([str, type(None)], None),
+        "ascii_resolution": ([str, type(None)], None),
+        "ascii_sample_res": ([int, type(None)], None),
+        "viser_log_camera": ([bool], False),
     }
     """A dictionary of arguments added manually by the :meth:`AppLauncher.add_app_launcher_args` method.
 
@@ -1190,6 +1247,19 @@ class AppLauncher:
             # Stored as a raw string; parsed and applied in SimulationContext.
             ascii_output = launcher_args.get("ascii_output")
             settings.set_string("/isaaclab/visualizer/ascii_output", ascii_output or "")
+            ascii_camera_pos = launcher_args.get("ascii_camera_pos")
+            settings.set_string("/isaaclab/visualizer/ascii_camera_pos", ascii_camera_pos or "")
+            ascii_camera_target = launcher_args.get("ascii_camera_target")
+            settings.set_string("/isaaclab/visualizer/ascii_camera_target", ascii_camera_target or "")
+            ascii_resolution = launcher_args.get("ascii_resolution")
+            settings.set_string("/isaaclab/visualizer/ascii_resolution", ascii_resolution or "")
+            ascii_sample_res = launcher_args.get("ascii_sample_res")
+            settings.set_int(
+                "/isaaclab/visualizer/ascii_sample_res",
+                int(ascii_sample_res) if ascii_sample_res is not None else -1,
+            )
+            viser_log_camera = bool(launcher_args.get("viser_log_camera", False))
+            settings.set_bool("/isaaclab/visualizer/viser_log_camera", viser_log_camera)
 
     def _interrupt_signal_handle_callback(self, signal, frame):
         """Handle the interrupt signal from the keyboard."""

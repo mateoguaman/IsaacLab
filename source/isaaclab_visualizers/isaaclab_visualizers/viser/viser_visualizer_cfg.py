@@ -41,3 +41,11 @@ class ViserVisualizerCfg(VisualizerCfg):
 
     Set to ``None`` to leave this option disabled.
     """
+
+    log_camera_pose: bool = False
+    """When ``True``, periodically print the first connected client's camera pose
+    to stdout. Useful for tuning the ``--ascii_camera_pos`` / ``--ascii_camera_target``
+    overrides of the ASCII visualizer against a live viser session."""
+
+    log_camera_pose_interval: float = 1.0
+    """Minimum seconds between camera-pose log lines when ``log_camera_pose`` is on."""

@@ -127,6 +127,8 @@ class ViserVisualizer(BaseVisualizer):
         self._active_record_path: str | None = None
         self._last_camera_pose: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
         self._pending_camera_pose: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+        self._last_camera_log_time: float = 0.0
+        self._last_logged_camera: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
 
     def initialize(self, scene_data_provider: BaseSceneDataProvider) -> None:
         """Initialize viewer resources and bind scene data provider.
@@ -191,6 +193,9 @@ class ViserVisualizer(BaseVisualizer):
         self._viewer.begin_frame(self._sim_time)
         self._viewer.log_state(self._state)
         self._viewer.end_frame()
+
+        if self.cfg.log_camera_pose:
+            self._maybe_log_client_camera_pose()
 
     def close(self) -> None:
         """Close viewer resources and finalize optional recording."""
@@ -347,3 +352,57 @@ class ViserVisualizer(BaseVisualizer):
         if self._last_camera_pose == pose or self._pending_camera_pose == pose:
             return
         self._set_viser_camera_view(pose)
+
+    def _read_first_client_camera(self) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+        """Read (position, look_at) from the first connected viser client, or None."""
+        if self._viewer is None:
+            return None
+        server = getattr(self._viewer, "_server", None)
+        get_clients = getattr(server, "get_clients", None) if server is not None else None
+        if not callable(get_clients):
+            return None
+        try:
+            clients = get_clients()
+        except Exception:
+            return None
+        client_iterable = list(clients.values()) if isinstance(clients, dict) else list(clients)
+        for client in client_iterable:
+            camera = getattr(client, "camera", None)
+            if camera is None:
+                continue
+            pos = getattr(camera, "position", None)
+            target = getattr(camera, "look_at", None)
+            if pos is None or target is None:
+                continue
+            try:
+                pos_t = (float(pos[0]), float(pos[1]), float(pos[2]))
+                target_t = (float(target[0]), float(target[1]), float(target[2]))
+            except Exception:
+                continue
+            return pos_t, target_t
+        return None
+
+    def _maybe_log_client_camera_pose(self) -> None:
+        """Throttle-log the live viser camera pose for tuning the ASCII camera."""
+        if self._sim_time - self._last_camera_log_time < self.cfg.log_camera_pose_interval:
+            return
+        pose = self._read_first_client_camera()
+        if pose is None:
+            return
+        self._last_camera_log_time = self._sim_time
+        if self._last_logged_camera is not None:
+            prev_pos, prev_tgt = self._last_logged_camera
+            pos, tgt = pose
+            if all(abs(a - b) < 1e-3 for a, b in zip(prev_pos, pos)) and all(
+                abs(a - b) < 1e-3 for a, b in zip(prev_tgt, tgt)
+            ):
+                return
+        self._last_logged_camera = pose
+        pos, tgt = pose
+        pos_s = f"{pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}"
+        tgt_s = f"{tgt[0]:.3f},{tgt[1]:.3f},{tgt[2]:.3f}"
+        logger.info(
+            "[ViserVisualizer] camera pose: --ascii_camera_pos %s --ascii_camera_target %s",
+            pos_s,
+            tgt_s,
+        )

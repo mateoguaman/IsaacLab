@@ -226,11 +226,34 @@ def launch_simulation(
         # Forward optional ascii transport override so AsciiVisualizerCfg can be
         # overridden without running AppLauncher (Kit-less Newton path).
         ascii_output = None
+        ascii_camera_pos = None
+        ascii_camera_target = None
+        ascii_resolution = None
+        ascii_sample_res = None
+        viser_log_camera = False
         if isinstance(launcher_args, argparse.Namespace):
             ascii_output = getattr(launcher_args, "ascii_output", None)
+            ascii_camera_pos = getattr(launcher_args, "ascii_camera_pos", None)
+            ascii_camera_target = getattr(launcher_args, "ascii_camera_target", None)
+            ascii_resolution = getattr(launcher_args, "ascii_resolution", None)
+            ascii_sample_res = getattr(launcher_args, "ascii_sample_res", None)
+            viser_log_camera = bool(getattr(launcher_args, "viser_log_camera", False))
         elif isinstance(launcher_args, dict):
             ascii_output = launcher_args.get("ascii_output")
+            ascii_camera_pos = launcher_args.get("ascii_camera_pos")
+            ascii_camera_target = launcher_args.get("ascii_camera_target")
+            ascii_resolution = launcher_args.get("ascii_resolution")
+            ascii_sample_res = launcher_args.get("ascii_sample_res")
+            viser_log_camera = bool(launcher_args.get("viser_log_camera", False))
         settings.set_string("/isaaclab/visualizer/ascii_output", ascii_output or "")
+        settings.set_string("/isaaclab/visualizer/ascii_camera_pos", ascii_camera_pos or "")
+        settings.set_string("/isaaclab/visualizer/ascii_camera_target", ascii_camera_target or "")
+        settings.set_string("/isaaclab/visualizer/ascii_resolution", ascii_resolution or "")
+        settings.set_int(
+            "/isaaclab/visualizer/ascii_sample_res",
+            int(ascii_sample_res) if ascii_sample_res is not None else -1,
+        )
+        settings.set_bool("/isaaclab/visualizer/viser_log_camera", viser_log_camera)
 
     try:
         yield
