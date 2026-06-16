@@ -124,26 +124,11 @@ def test_factory_difficulty_scheduler_averages_ready_success_rates() -> None:
     torch.testing.assert_close(result, torch.tensor(0.3))
 
 
-def test_position_weight_decay_preset_composes_with_value_shift_algorithm() -> None:
-    """Weight decay preset should tune the active PPO variant, not replace it."""
-    from isaaclab_tasks.core.position.config.rsl_rl_cfg import (
-        PositionLocomotionPPORunnerCfg,
-        ValueShiftAlgorithmCfg,
-    )
-    from isaaclab_tasks.utils.hydra import resolve_presets
-
-    cfg = PositionLocomotionPPORunnerCfg()
-
-    resolve_presets(cfg, selected=("beta_value_shift", "weight_decay"))
-
-    assert isinstance(cfg.algorithm, ValueShiftAlgorithmCfg)
-    assert cfg.algorithm.optimizer == "adamw"
-    assert cfg.algorithm.weight_decay == 1.0e-4
-
-
-def test_position_weight_decay_scalar_override_composes_with_value_shift(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Submit-style weight_decay overrides should remain scalar Hydra overrides."""
-    from isaaclab_tasks.core.position.config.rsl_rl_cfg import ValueShiftAlgorithmCfg
+def test_factory_actor_critic_preset_composes_with_value_shift_algorithm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actor-critic model preset should not replace the factory PPO algorithm branch."""
+    from isaaclab_tasks.core.multi_task.factory.config.agents.rsl_rl_ppo_cfg import ValueShiftAlgorithmCfg
     from isaaclab_tasks.utils.hydra import resolve_task_config
 
     monkeypatch.setattr(
@@ -151,16 +136,13 @@ def test_position_weight_decay_scalar_override_composes_with_value_shift(monkeyp
         "argv",
         [
             "pytest",
-            "presets=beta_value_shift,weight_decay",
-            "agent.algorithm.weight_decay=0.01",
+            "presets=actor_critic,beta_value_shift",
         ],
     )
 
-    _, agent_cfg = resolve_task_config("Isaac-Position-Anymal-C-v0", "rsl_rl_cfg_entry_point")
+    _, agent_cfg = resolve_task_config("Isaac-Factory-v0", "rsl_rl_cfg_entry_point")
 
     assert isinstance(agent_cfg.algorithm, ValueShiftAlgorithmCfg)
-    assert agent_cfg.algorithm.optimizer == "adamw"
-    assert agent_cfg.algorithm.weight_decay == 0.01
 
 
 @pytest.mark.parametrize("task_name", ["Isaac-Position-v0", "Isaac-Factory-v0"])

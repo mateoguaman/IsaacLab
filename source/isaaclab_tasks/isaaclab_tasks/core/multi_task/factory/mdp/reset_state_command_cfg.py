@@ -68,9 +68,13 @@ class FactoryResetStateTableCfg(StateCommandCfg.TaskTableCfg):
     state_table_fps_features: Callable | None = None
     """Feature extractor for state-table compaction and sampler layout."""
 
-    settle_steps: int = 24
-    """Physics steps each pipeline batch settles for before harvesting (the
-    simulation-validated acceptance label). ``0`` stores rows geometrically."""
+    settle_steps: int = 0
+    """Physics settle steps before harvesting. Default ``0`` stores rows geometrically: a
+    settle filter cannot be reproduced by the no-sim retarget/preview path, so it would make
+    the stored table diverge from -- and not be validatable by -- that path. The geometric
+    criteria (reachability, collision, aperture) are the acceptance test, and ``nut_bounds``
+    below is the only other filter (geometric, reproducible offline). Set ``> 0`` to opt into
+    a physics settle, accepting it is not offline-validatable."""
 
     settle_max_drift: float = 0.005
     """Reject a settled row whose held-asset position drifted more than this [m]."""

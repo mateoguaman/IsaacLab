@@ -1191,6 +1191,36 @@ def test_apply_overrides_aliased_globals_no_conflict():
     assert env_cfg.mode == SharedCfg()
 
 
+@pytest.mark.parametrize(
+    "selected",
+    [
+        ["actor_critic", "beta_value_shift"],
+        ["beta_value_shift", "actor_critic"],
+    ],
+)
+def test_apply_overrides_default_alias_global_yields_to_specific_global(selected: list[str]):
+    """Default-equivalent globals compose with a specific preset on the same node."""
+
+    @configclass
+    class AlgorithmPresetCfg(PresetCfg):
+        actor_critic: str = "ppo"
+        default: str = actor_critic
+        beta_value_shift: str = "value_shift"
+
+    @configclass
+    class DefaultAliasAgentCfg:
+        algorithm: AlgorithmPresetCfg = AlgorithmPresetCfg()
+
+    env_cfg = PresetCfgEnvCfg()
+    agent_cfg = DefaultAliasAgentCfg()
+    presets = {"env": collect_presets(env_cfg), "agent": collect_presets(agent_cfg)}
+    hydra_cfg = {"env": env_cfg.to_dict(), "agent": agent_cfg.to_dict()}
+
+    apply_overrides(env_cfg, agent_cfg, hydra_cfg, selected, [], [], presets)
+
+    assert agent_cfg.algorithm == "value_shift"
+
+
 # =============================================================================
 # Tests: parse_overrides edge cases
 # =============================================================================

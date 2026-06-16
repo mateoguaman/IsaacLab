@@ -144,6 +144,8 @@ class SuccessorLatentAlgorithmCfg(RslRlPpoAlgorithmCfg):
 
 @configclass
 class PpoAlgorithmCfg(PresetCfg):
+    """Algorithm preset selectable via ``agent.algorithm=<name>``."""
+
     actor_critic = RslRlPpoAlgorithmCfg(class_name="PPO", **_FACTORY_PPO_KWARGS)
     default = actor_critic
     value_shift = ValueShiftAlgorithmCfg(**_FACTORY_PPO_KWARGS)

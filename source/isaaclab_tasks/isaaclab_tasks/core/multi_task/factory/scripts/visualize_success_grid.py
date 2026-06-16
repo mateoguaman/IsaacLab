@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Preview the factory curriculum images with RANDOM success / sampling values, no sim.
+"""Preview the factory curriculum images with synthetic spread success / sampling values, no sim.
 
 A fast eyeball for the curriculum image logger (:mod:`..viz.sampler_images`):
 builds the board library + reset states via :class:`FactoryIKPipeline` (the same
@@ -14,7 +14,10 @@ and writes them to PNGs. No training run required.
 
 Run:
   S=source/isaaclab_tasks/isaaclab_tasks/core/multi_task/factory/scripts/visualize_success_grid.py
-  ./isaaclab.sh -p $S presets=franka,nut_thread_m16 --num_boards 16 --rows_per_board 10
+  ./isaaclab.sh -p $S presets=franka,nut_thread_m16
+  # board count / rows-per-board / placement / FPS weights come from the resolved cfg;
+  # change them via preset or hydra, e.g.
+  #   presets=franka,nut_thread_m16 commands.reset_state.task_table.pipeline_cfg.board.num_boards=32
   # -> /tmp/factory_success_grid.png (grid) and _tags.png (tag matrix)
 """
 
@@ -39,27 +42,10 @@ from isaaclab_tasks.core.multi_task.factory.viz.sampler_images import (
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Preview the factory success grid with random values (no sim).")
-    ap.add_argument("--num_boards", type=int, default=16, help="Board-library size (small = fast preview).")
-    ap.add_argument("--rows_per_board", type=int, default=10, help="Reset-state rows per board configuration.")
-    ap.add_argument(
-        "--placements_per_board",
-        type=int,
-        default=None,
-        help="Override placement candidates/board (nut-position supply).",
-    )
-    ap.add_argument(
-        "--grasps_per_placement",
-        type=int,
-        default=None,
-        help="Override grasps/placement (fewer = less grasp redundancy).",
-    )
-    ap.add_argument(
-        "--fps_nut_weight", type=float, default=None, help="Row-FPS weight on nut position (raise for more nuts)."
-    )
-    ap.add_argument(
-        "--fps_approach_weight", type=float, default=None, help="Row-FPS weight on grasp approach direction."
-    )
-    ap.add_argument("--fps_tag_weight", type=float, default=None, help="Row-FPS weight on placement-tag one-hot.")
+    # No cfg-shaping flags. Board count, rows/board, placement/grasp counts, and row-FPS
+    # weights all come from the resolved production cfg. Override them via preset or hydra
+    # dotted syntax (e.g. ``commands.reset_state.task_table.pipeline_cfg.board.num_boards=32``),
+    # not custom argparse flags. Only rendering/output knobs live below.
     ap.add_argument("--max_states_per_board", type=int, default=None, help="Cap states drawn per cell (default: all).")
     ap.add_argument("--k", type=int, default=16, help="Silhouette polygon resolution (support directions).")
     ap.add_argument("--link_mode", choices=["outline", "fill", "off"], default="outline", help="Robot link rendering.")
@@ -84,23 +70,12 @@ def main() -> None:
 
     table_cfg = resolve_from_task()
     cfg = table_cfg.pipeline_cfg
-    cfg.board.num_boards = args.num_boards
-    if args.placements_per_board is not None:
-        cfg.placement.placements_per_board = args.placements_per_board
-    if args.grasps_per_placement is not None:
-        cfg.placement.grasp.grasps_per_placement = args.grasps_per_placement
-    if args.fps_nut_weight is not None:
-        cfg.row_selection.nut_weight = args.fps_nut_weight
-    if args.fps_approach_weight is not None:
-        cfg.row_selection.approach_weight = args.fps_approach_weight
-    if args.fps_tag_weight is not None:
-        cfg.row_selection.tag_weight = args.fps_tag_weight
 
     pipeline = FactoryIKPipeline(cfg)
-    result = pipeline.build_balanced_table(args.rows_per_board * cfg.board.num_boards)
+    result = pipeline.build_balanced_table(table_cfg.rows_per_board * cfg.board.num_boards)
     print(f"\n{pipeline.rejection_summary}")
     n_states = int(result.joint_q.shape[0])
-    print(f"[viz] {n_states} reset states across {args.num_boards} board configurations")
+    print(f"[viz] {n_states} reset states across {cfg.board.num_boards} board configurations")
 
     # --- diagnostics the grid surfaces: OOB-at-start + nut-placement diversity ---
     nut_xyz = result.nut_pose[:, :3]
@@ -159,8 +134,15 @@ def main() -> None:
     n_slots = int(spawn_index.shape[0])
 
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
-    success = torch.rand(n_slots, generator=gen).to(device)
-    prob = torch.rand(n_slots, generator=gen).to(device)
+    # Synthetic SPREAD (per-board gradient + jitter), not uniform random: per-cell averaging
+    # collapses uniform random to ~0.5 (the colormap's pale middle), so nothing reads. A
+    # gradient makes the full colormap range visible across the grid. Real success / sampling
+    # mass come from training; this is only a layout + color-legibility preview.
+    boards = torch.unique(board_of)
+    rank = torch.searchsorted(boards, board_of).float() / max(1, boards.numel() - 1)  # [n_kept] in 0..1
+    jit = ((torch.rand(2, board_of.shape[0], generator=gen) - 0.5) * 0.25).to(device)
+    success = (rank + jit[0]).clamp(0.0, 1.0)[spawn_index]  # red -> green across boards
+    prob = (1.0 - rank + jit[1]).clamp(0.0, 1.0)[spawn_index]  # opposite gradient, distinct panel
     prob = prob / prob.sum()
 
     grid_table = SimpleNamespace(spawn_index=spawn_index, target_index=target_index, **geom)
@@ -188,6 +170,8 @@ def main() -> None:
         link_alpha=args.link_alpha,
         nut_scale=args.nut_scale,
         bound_xy=bound_xy,
+        dpi=180,  # standalone inspection render: sharper than the periodic wandb log (dpi 70)
+        cell_fill_alpha=0.55,  # tint each cell by its metric so the color reads at a glance
     )
     path = f"{args.out}.png"
     plt.imsave(path, image)

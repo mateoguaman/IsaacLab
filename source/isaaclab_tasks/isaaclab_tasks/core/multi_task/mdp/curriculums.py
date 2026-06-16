@@ -67,8 +67,20 @@ class success_rate_sampler(ManagerTermBase):
         self.sample_indices[env_ids] = choices[: len(env_ids)]
 
         if sampler_visual_logger is not None:
-            self._log_counter += 1
-            if self._log_counter % sampler_visual_log_period == 0:
-                sampler_visual_logger(env, self._sampler, self.success_rates, probs)
+            # The RL wrapper resets the env once (running this term) before the runner starts
+            # wandb, so counter 0 lands while ``wandb.run`` is None and that upload is dropped.
+            # Hold the schedule until the logging backend is live, then emit on the first
+            # post-init call (counter 0) and every period after -- otherwise the first image
+            # waits a full period.
+            try:
+                import wandb  # noqa: PLC0415
+
+                backend_live = wandb.run is not None
+            except ImportError:
+                backend_live = False
+            if backend_live:
+                if self._log_counter % sampler_visual_log_period == 0:
+                    sampler_visual_logger(env, self._sampler, self.success_rates, probs)
+                self._log_counter += 1
 
         return {"success": self.success_rates.mean()}

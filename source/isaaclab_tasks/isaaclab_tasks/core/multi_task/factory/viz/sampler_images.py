@@ -116,6 +116,7 @@ def render_board_grids(
     nut_scale: float = 2.5,
     bound_xy: tuple[tuple[float, float], tuple[float, float]] | None = None,
     dpi: int = 90,
+    cell_fill_alpha: float = 0.0,
 ) -> np.ndarray | None:
     """Render one or more per-board metric grids side by side, or ``None`` if no geometry is stashed.
 
@@ -198,6 +199,14 @@ def render_board_grids(
         colors = cmap(norm(rate))[keep]
 
         ax = sub.add_axes((0.01, 0.10, 0.98, 0.86))
+        cell_mean = np.array([rate[s].mean() if s.size else vlo for s in states_by_cell])
+        cell_colors = cmap(norm(cell_mean))
+        # translucent per-cell metric fill drawn first (underneath the detail) so the color
+        # reads at a glance instead of only on the thin border + small nut markers
+        if cell_fill_alpha > 0.0:
+            cell_face = cell_colors.copy()
+            cell_face[:, 3] = cell_fill_alpha
+            ax.add_collection(PolyCollection(rects, facecolors=cell_face, edgecolors="none"))
         ax.add_collection(PolyCollection(board_t, facecolors="none", edgecolors=[_BOARD_EDGE], linewidths=0.5))
         ax.add_collection(PolyCollection(bolt_t, facecolors=[_BOLT_FACE], edgecolors=[_BOLT_EDGE], linewidths=0.4))
         if bound_xy is not None:
@@ -214,8 +223,7 @@ def render_board_grids(
         ncols_rgba = colors.copy()
         ncols_rgba[:, 3] = 0.95
         ax.add_collection(PolyCollection(nut_t, facecolors=ncols_rgba, edgecolors=[_NUT_EDGE], linewidths=0.3))
-        cell_mean = np.array([rate[s].mean() if s.size else vlo for s in states_by_cell])
-        ax.add_collection(PolyCollection(rects, facecolors="none", edgecolors=cmap(norm(cell_mean)), linewidths=1.1))
+        ax.add_collection(PolyCollection(rects, facecolors="none", edgecolors=cell_colors, linewidths=1.1))
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
         ax.set_aspect("equal")
@@ -367,11 +375,13 @@ def log_factory_board_grid(env, sampler, success_rates: torch.Tensor, probs: tor
                 ("sampling probability", probs, _PROB_CMAP, None, None),
             ],
             step=step,
-            # rasterization-bound (~0.1 ms / link polygon), so keep the periodic log
-            # quick by drawing fewer states at a lower dpi (~1.3 s); the standalone
-            # script renders all states at full dpi for detailed inspection
+            # rasterization-bound, so keep the periodic log quick by drawing fewer states
+            # (max_states_per_board=8). A translucent per-cell fill makes the success /
+            # sampling color readable at a glance instead of only the thin border + markers;
+            # the standalone script renders all states at higher dpi for detailed inspection.
             max_states_per_board=8,
-            dpi=70,
+            dpi=110,
+            cell_fill_alpha=0.55,
         ),
         _MATRIX_TAG: render_tag_matrices(
             table,
