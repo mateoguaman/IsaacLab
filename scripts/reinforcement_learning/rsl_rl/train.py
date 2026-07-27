@@ -25,10 +25,6 @@ import sys
 import time
 from datetime import datetime
 
-os.environ["WANDB_API_KEY"] = "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"
-os.environ["WANDB_USERNAME"] = "uw-lab"
-os.environ["WANDB_ENTITY"] = "uw-lab"
-
 # Convert NCCL hangs into timeouts so SLURM auto-requeue can fire on multi-GPU/-node jobs.
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
