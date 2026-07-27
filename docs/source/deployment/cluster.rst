@@ -16,14 +16,15 @@ convert the Isaac Lab Docker image into a singularity image and use it to submit
 
 .. attention::
 
-    Cluster setup varies across different institutions. The following instructions have been
-    tested on the `ETH Zurich Euler`_ cluster (which uses the SLURM workload manager), and the
-    IIT Genoa Franklin cluster (which uses PBS workload manager).
+   This branch (``feature/uw-cluster``) targets the University of Washington's Hyak/Klone
+   and Tillicum clusters. For the full deployment workflow — multi-cluster dispatch,
+   auto-resume on preemption, hyperparameter sweeps, and the ``cluster_helpers.sh``
+   bash wrappers — see :doc:`uw_cluster`.
 
-    The instructions may need to be adapted for other clusters. If you have successfully
-    adapted the instructions for another cluster, please consider contributing to the
-    documentation.
+   This page covers only the one-time local prerequisites (``apptainer`` and SSH)
+   that the UW workflow builds on.
 
+.. _cluster-setup-instructions:
 
 Setup Instructions
 ------------------
@@ -53,159 +54,13 @@ the user cluster password from being requested multiple times.
   In the case of issues, please try to switch to those versions.
 
 
-Configuring the cluster parameters
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Next steps
+----------
 
-First, you need to configure the cluster-specific parameters in ``docker/cluster/.env.cluster`` file.
-The following describes the parameters that need to be configured:
+Once ``apptainer`` is installed locally and SSH is configured, follow :doc:`uw_cluster`
+for cluster configuration, image push, and job submission.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 20 80
-
-   * - Parameter
-     - Description
-   * - CLUSTER_JOB_SCHEDULER
-     - The job scheduler/workload manager used by your cluster. Currently, we support 'SLURM' and
-       'PBS' workload managers.
-   * - CLUSTER_ISAAC_SIM_CACHE_DIR
-     - The directory on the cluster where the Isaac Sim cache is stored. This directory
-       has to end on ``docker-isaac-sim``. It will be copied to the compute node
-       and mounted into the singularity container. This should increase the speed of starting
-       the simulation.
-   * - CLUSTER_ISAACLAB_DIR
-     - The directory on the cluster where the Isaac Lab logs are stored. This directory has to
-       end on ``isaaclab``. It will be copied to the compute node and mounted into
-       the singularity container. When a job is submitted, the latest local changes will
-       be copied to the cluster to a new directory in the format ``${CLUSTER_ISAACLAB_DIR}_${datetime}``
-       with the date and time of the job submission. This allows to run multiple jobs with different code versions at
-       the same time.
-   * - CLUSTER_LOGIN
-     - The login to the cluster. Typically, this is the user and cluster names,
-       e.g., ``your_user@euler.ethz.ch``.
-   * - CLUSTER_SIF_PATH
-     - The path on the cluster where the singularity image will be stored. The image will be
-       copied to the compute node but not uploaded again to the cluster when a job is submitted.
-   * - REMOVE_CODE_COPY_AFTER_JOB
-     - Whether the copied code should be removed after the job is finished or not. The logs from the job will not be deleted
-       as these are saved under the permanent ``CLUSTER_ISAACLAB_DIR``. This feature is useful
-       to save disk space on the cluster. If set to ``true``, the code copy will be removed.
-   * - CLUSTER_PYTHON_EXECUTABLE
-     - The path within Isaac Lab to the Python executable that should be executed in the submitted job.
-
-When a ``job`` is submitted, it will also use variables defined in ``docker/.env.base``, though these
-should be correct by default.
-
-Exporting to singularity image
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Next, we need to export the Docker image to a singularity image and upload
-it to the cluster. This step is only required once when the first job is submitted
-or when the Docker image is updated. For instance, due to an upgrade of the Isaac Sim
-version, or additional requirements for your project.
-
-To export to a singularity image, execute the following command:
-
-.. code:: bash
-
-    ./docker/cluster/cluster_interface.sh push [profile]
-
-This command will create a singularity image under ``docker/exports`` directory and
-upload it to the defined location on the cluster. It requires that you have previously
-built the image with the ``container.py`` interface. Be aware that creating the singularity
-image can take a while.
-``[profile]`` is an optional argument that specifies the container profile to be used. If no profile is
-specified, the default profile ``base`` will be used.
-
-.. note::
-  By default, the singularity image is created without root access by providing the ``--fakeroot`` flag to
-  the ``apptainer build`` command. In case the image creation fails, you can try to create it with root
-  access by removing the flag in ``docker/cluster/cluster_interface.sh``.
-
-
-Defining the job parameters
----------------------------
-
-The job parameters need to be defined based on the job scheduler used by your cluster.
-You only need to update the appropriate script for the scheduler available to you.
-
-- For SLURM, update the parameters in ``docker/cluster/submit_job_slurm.sh``.
-- For PBS, update the parameters in ``docker/cluster/submit_job_pbs.sh``.
-
-For SLURM
-~~~~~~~~~
-
-The job parameters are defined inside the ``docker/cluster/submit_job_slurm.sh``.
-A typical SLURM operation requires specifying the number of CPUs and GPUs, the memory, and
-the time limit. For more information, please check the `SLURM documentation`_.
-
-The default configuration is as follows:
-
-.. literalinclude:: ../../../docker/cluster/submit_job_slurm.sh
-  :language: bash
-  :lines: 12-19
-  :linenos:
-  :lineno-start: 12
-
-An essential requirement for the cluster is that the compute node has access to the internet at all times.
-This is required to load assets from the Nucleus server. For some cluster architectures, extra modules
-must be loaded to allow internet access.
-
-For instance, on ETH Zurich Euler cluster, the ``eth_proxy`` module needs to be loaded. This can be done
-by adding the following line to the ``submit_job_slurm.sh`` script:
-
-.. literalinclude:: ../../../docker/cluster/submit_job_slurm.sh
-  :language: bash
-  :lines: 3-5
-  :linenos:
-  :lineno-start: 3
-
-For PBS
-~~~~~~~
-
-The job parameters are defined inside the ``docker/cluster/submit_job_pbs.sh``.
-A typical PBS operation requires specifying the number of CPUs and GPUs, and the time limit. For more
-information, please check the `PBS Official Site`_.
-
-The default configuration is as follows:
-
-.. literalinclude:: ../../../docker/cluster/submit_job_pbs.sh
-  :language: bash
-  :lines: 11-17
-  :linenos:
-  :lineno-start: 11
-
-
-Submitting a job
-----------------
-
-To submit a job on the cluster, the following command can be used:
-
-.. code:: bash
-
-    ./docker/cluster/cluster_interface.sh job [profile] "argument1" "argument2" ...
-
-This command will copy the latest changes in your code to the cluster and submit a job. Please ensure that
-your Python executable's output is stored under ``isaaclab/logs`` as this directory is synced between the compute
-node and ``CLUSTER_ISAACLAB_DIR``.
-
-``[profile]`` is an optional argument that specifies which singularity image corresponding to the  container profile
-will be used. If no profile is specified, the default profile ``base`` will be used. The profile has be defined
-directlty after the ``job`` command. All other arguments are passed to the Python executable. If no profile is
-defined, all arguments are passed to the Python executable.
-
-The training arguments are passed to the Python executable. As an example, the standard
-ANYmal rough terrain locomotion training can be executed with the following command:
-
-.. code:: bash
-
-    ./docker/cluster/cluster_interface.sh job --task IsaacContrib-Velocity-Rough-AnymalC --video --enable_cameras
-
-The above will, in addition, also render videos of the training progress and store them under ``isaaclab/logs`` directory.
 
 .. _Singularity: https://docs.sylabs.io/guides/2.6/user-guide/index.html
-.. _ETH Zurich Euler: https://www.gdc-docs.ethz.ch/EulerManual/site/overview/
-.. _PBS Official Site: https://openpbs.org/
 .. _apptainer: https://apptainer.org/
 .. _documentation: https://www.apptainer.org/docs/admin/main/installation.html#install-ubuntu-packages
-.. _SLURM documentation: https://www.slurm.schedmd.com/sbatch.html

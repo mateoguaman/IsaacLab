@@ -25,6 +25,14 @@ import sys
 import time
 from datetime import datetime
 
+os.environ["WANDB_API_KEY"] = "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"
+os.environ["WANDB_USERNAME"] = "uw-lab"
+os.environ["WANDB_ENTITY"] = "uw-lab"
+
+# Convert NCCL hangs into timeouts so SLURM auto-requeue can fire on multi-GPU/-node jobs.
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+
 import gymnasium as gym
 import torch
 from packaging import version
@@ -38,7 +46,7 @@ from isaaclab.utils.string import list_intersection, string_to_callable
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 
 import isaaclab_tasks  # noqa: F401
-from isaaclab_tasks.utils import get_checkpoint_path, setup_preset_cli
+from isaaclab_tasks.utils import get_checkpoint_path, setup_preset_cli, write_run_manifest
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # local imports
@@ -82,6 +90,15 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+parser.add_argument(
+    "--run_id",
+    type=str,
+    default=None,
+    help=(
+        "Unique run identifier (e.g., SLURM_JOB_ID). If provided, uses this as the log directory name "
+        "instead of a timestamp, enabling automatic resumption when a cluster job is requeued."
+    ),
+)
 parser.add_argument("--external_callback", default=None, help="Fully qualified path to an externally defined callback.")
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
@@ -97,6 +114,9 @@ remaining_args_env_registration = None
 if args_cli.external_callback:
     external_callback_function = string_to_callable(args_cli.external_callback, separator=".")
     remaining_args_env_registration = external_callback_function()
+
+# Snapshot the original CLI args for the run manifest before Hydra clobbers sys.argv.
+original_train_args = sys.argv[1:]
 
 # clear out sys.argv for Hydra
 # The remaining arguments are the arguments that were not consumed by both this scripts
@@ -163,18 +183,51 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env_cfg.seed = seed
             agent_cfg.seed = seed
 
+        # Gate expensive or duplicate work (config dumps, stdout prints) behind rank 0.
+        is_main_process = not args_cli.distributed or int(os.getenv("RANK", "0")) == 0
+
         # specify directory for logging experiments
         log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
         log_root_path = os.path.abspath(log_root_path)
-        print(f"[INFO] Logging experiment in directory: {log_root_path}")
-        # specify directory for logging runs: {time-stamp}_{run_name}
-        log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if is_main_process:
+            print(f"[INFO] Logging experiment in directory: {log_root_path}")
+
+        # Build the per-run log directory. With --run_id (e.g., SLURM_JOB_ID) we use a
+        # deterministic name so that a cluster requeue writes to the same directory and
+        # picks up the previous attempt's checkpoints. Without --run_id we keep the
+        # timestamp-based layout used for local/interactive runs.
+        if args_cli.run_id:
+            log_dir = args_cli.run_id
+        else:
+            log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
         # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not
         # change it (see PR #2346, comment-2819298849)
-        print(f"Exact experiment name requested from command line: {log_dir}")
+        if is_main_process:
+            print(f"Exact experiment name requested from command line: {log_dir}")
+
         if agent_cfg.run_name:
             log_dir += f"_{agent_cfg.run_name}"
         log_dir = os.path.join(log_root_path, log_dir)
+
+        if is_main_process:
+            write_run_manifest(
+                log_dir,
+                args_cli.task,
+                agent_cfg.experiment_name,
+                train_args=original_train_args,
+            )
+
+        # Auto-resume: if --run_id points to a directory that already contains .pt
+        # checkpoints (e.g., after SLURM preemption or a time-limit requeue), enable
+        # resume so the next attempt picks up where the last one left off.
+        if args_cli.run_id and os.path.exists(log_dir):
+            checkpoint_files = [f for f in os.listdir(log_dir) if f.endswith(".pt")]
+            if checkpoint_files:
+                if is_main_process:
+                    print(f"[INFO] Found existing run with {len(checkpoint_files)} checkpoint(s). Auto-resuming...")
+                agent_cfg.resume = True
+                agent_cfg.load_run = os.path.basename(log_dir)
 
         # set the IO descriptors export flag if requested
         if isinstance(env_cfg, ManagerBasedRLEnvCfg):
@@ -219,7 +272,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
         # create runner from rsl-rl
-        runner = agent_cfg.class_type(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner_cfg = agent_cfg.to_dict()
+        # Forward --run_id so the wandb writer can use it as a deterministic run id;
+        # requeued cluster jobs then resume the same wandb run instead of creating a new one.
+        # Guard against clobbering a run_id already set by --wandb_run_id (which routes
+        # through update_rsl_rl_cfg and lands on agent_cfg.run_id before to_dict).
+        if args_cli.run_id and not runner_cfg.get("run_id"):
+            runner_cfg["run_id"] = args_cli.run_id
+        runner = agent_cfg.class_type(env, runner_cfg, log_dir=log_dir, device=agent_cfg.device)
         # write git state to logs
         runner.add_git_repo_to_log(__file__)
         # load the checkpoint
@@ -228,13 +288,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # load previously trained model
             runner.load(resume_path)
 
-        # dump the configuration into log-directory
-        dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+        # Calculate the number of learning iterations to run. runner.learn() runs
+        # num_learning_iterations starting from runner.current_learning_iteration,
+        # so when resuming we must subtract what was already completed.
+        iterations_to_run = agent_cfg.max_iterations
+        if agent_cfg.resume and hasattr(runner, "current_learning_iteration"):
+            iterations_to_run = agent_cfg.max_iterations - runner.current_learning_iteration
+            if is_main_process:
+                print(
+                    f"[INFO] Resuming from iteration {runner.current_learning_iteration}."
+                    f" Remaining iterations: {iterations_to_run}"
+                )
+            if iterations_to_run <= 0:
+                if is_main_process:
+                    print(
+                        f"[INFO] Training already completed (Current:"
+                        f" {runner.current_learning_iteration} >= Max: {agent_cfg.max_iterations})."
+                        f" Exiting."
+                    )
+                exit(0)
+
+        # dump the configuration into log-directory (rank 0 only to avoid all ranks
+        # racing to write the same files in a distributed run)
+        if is_main_process:
+            dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+            dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+            # Forward IsaacLab artifacts to rsl_rl so wandb/neptune upload them when
+            # the logging writer initializes inside runner.learn(). Gated on
+            # add_file_to_log presence so train.py still runs against rsl-rl-lib
+            # releases that predate this hook.
+            if hasattr(runner, "add_file_to_log"):
+                runner.add_file_to_log(os.path.join(log_dir, "manifest.json"))
+                runner.add_file_to_log(os.path.join(log_dir, "params", "env.yaml"))
+                runner.add_file_to_log(os.path.join(log_dir, "params", "agent.yaml"))
 
         # run training
         try:
-            runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+            runner.learn(num_learning_iterations=iterations_to_run, init_at_random_ep_len=True)
             print(f"Training time: {round(time.time() - start_time, 2)} seconds")
             # close the simulator
             env.close()

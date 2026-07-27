@@ -42,11 +42,18 @@ After cloning, you can choose the deployment workflow that fits your needs:
 
 - :doc:`cluster`
 
-  - Learn how to run Isaac Lab on high-performance computing (HPC) clusters.
-  - Explains how to export the Docker image to a Singularity (Apptainer) image, configure cluster-specific parameters,
-    and submit jobs using common workload managers (SLURM or PBS).
-  - Includes tested workflows for ETH Zurich's Euler cluster and IIT Genoa's Franklin cluster,
-    with notes on adapting to other environments.
+  - Covers the one-time local prerequisites (``apptainer`` install, SSH setup)
+    shared by every cluster deployment workflow.
+
+- :doc:`uw_cluster`
+
+  - Full deployment workflow for the University of Washington's Hyak/Klone and Tillicum
+    SLURM clusters.
+  - Describes the ``cluster_helpers.sh`` bash wrappers (``cluster_setup``,
+    ``cluster_submit``, ``cluster_sweep``, ``cluster_collect``) which keep cluster infra
+    off your working branch via a transient squash-merge of ``feature/uw-cluster``.
+  - Includes multi-cluster dispatch, auto-resume on preemption, hyperparameter
+    sweeps, Weights & Biases propagation, and troubleshooting.
 
 .. toctree::
    :maxdepth: 1
@@ -55,3 +62,4 @@ After cloning, you can choose the deployment workflow that fits your needs:
    docker
    run_docker_example
    cluster
+   uw_cluster

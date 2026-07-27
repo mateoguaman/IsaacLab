@@ -675,6 +675,29 @@ def _install_extra_feature(feature_name: str, selector: str = "") -> None:
         )
 
 
+def _install_local_rsl_rl() -> None:
+    """Install a local rsl_rl clone in editable mode if one exists at the repo root.
+
+    When a clone lives at ``<IsaacLab>/rsl_rl`` (gitignored but not dockerignored,
+    so cluster rsync ships it with the code snapshot), this installs it in
+    editable mode so it overrides the PyPI ``rsl-rl-lib`` package. Because the
+    install is editable and the container bind-mounts the code snapshot at a
+    stable path, code changes inside the clone are picked up on subsequent jobs
+    without rebuilding the image.
+    """
+    local_rsl_rl = ISAACLAB_ROOT / "rsl_rl"
+    if not local_rsl_rl.is_dir():
+        return
+    if not (local_rsl_rl / "setup.py").exists() and not (local_rsl_rl / "pyproject.toml").exists():
+        return
+    python_exe = extract_python_exe()
+    pip_cmd = get_pip_command(python_exe)
+    print_info(f"Found local rsl_rl at {local_rsl_rl} — installing in editable mode (overrides PyPI rsl-rl-lib).")
+    # Use compat editable mode; strict mode breaks rsl_rl's resolve_callable (it ends up
+    # importing the project's setup.py from a misleading __path__, which calls sys.exit).
+    run_command(pip_cmd + ["install", "-e", str(local_rsl_rl), "--config-settings", "editable_mode=compat"])
+
+
 _PREBUNDLE_REPOINT_PACKAGES: list[str] = [
     "torch",
     "torchvision",
@@ -979,6 +1002,11 @@ def command_install(install_type: str = "all") -> None:
             print_info("Installing extra feature dependencies...")
             for feature_name, selector in extra_features:
                 _install_extra_feature(feature_name, selector)
+
+        # If the user has a local rsl_rl/ clone at the repo root, install it editable
+        # so it overrides the PyPI rsl-rl-lib package. Runs after _install_extra_frameworks
+        # so this editable install wins when both are present.
+        _install_local_rsl_rl()
 
         # In some rare cases, torch might not be installed properly by pyproject.toml, add one more check here.
         # Can prevent that from happening.
