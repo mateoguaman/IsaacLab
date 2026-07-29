@@ -11,6 +11,8 @@ __all__: list[str] = []
 
 from pathlib import Path
 
+import isaaclab.sim as sim_utils
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
 from isaaclab_tasks.utils import preset
@@ -43,11 +45,46 @@ _ANYMAL_C_CFG: ArticulationCfg = anymal.ANYMAL_C_CFG.replace(prim_path="{ENV_REG
 _ANYMAL_C_CFG.spawn.usd_path = (  # type: ignore[attr-defined]
     "https://uwlab-assets.s3.us-west-004.backblazeb2.com/Robots/ANYbotics/ANYmal-C/anymal_c.usd"
 )
-_ANYMAL_C_CFG.actuators["legs"] = _ANYMAL_C_CFG.actuators["legs"].replace(
+# LSTM actuator (default / PhysX): the neural ANYdrive model. Its network_file swaps to the
+# TorchScript checkpoint under Newton.
+_LSTM_LEGS = _ANYMAL_C_CFG.actuators["legs"].replace(
     network_file=preset(
         default=anymal.ANYDRIVE_3_LSTM_ACTUATOR_CFG.network_file,
         newton_mjwarp=ANYDRIVE_3_LSTM_JIT_PATH,
     )
+)
+
+# Implicit (stiff-PD) actuator: the physics solver applies the PD directly, with no neural net,
+# so it sidesteps the Newton neural-LSTM controller entirely. Gains match the ANYdrive drivetrain
+# (from feature/locomotion_video). Select with ``presets=...,implicit_actuator``.
+ANYDRIVE_3_SIMPLE_ACTUATOR_CFG = ImplicitActuatorCfg(
+    joint_names_expr=[".*HAA", ".*HFE", ".*KFE"],
+    effort_limit_sim=80.0,
+    velocity_limit_sim=7.5,
+    effort_limit=80.0,
+    velocity_limit=7.5,
+    stiffness={".*": 40.0},
+    damping={".*": 5.0},
+    armature={".*": 0.15},
+)
+
+_ANYMAL_C_CFG.actuators["legs"] = preset(
+    default=_LSTM_LEGS,
+    lstm_actuator=_LSTM_LEGS,
+    implicit_actuator=ANYDRIVE_3_SIMPLE_ACTUATOR_CFG,
+)
+# The implicit actuator needs matching joint-drive gains on the spawn so the solver applies the
+# PD; the LSTM path keeps whatever drive props the base cfg had.
+_ANYMAL_C_CFG.spawn.joint_drive_props = preset(  # type: ignore[attr-defined]
+    default=_ANYMAL_C_CFG.spawn.joint_drive_props,  # type: ignore[attr-defined]
+    lstm_actuator=_ANYMAL_C_CFG.spawn.joint_drive_props,  # type: ignore[attr-defined]
+    implicit_actuator=sim_utils.JointDrivePropertiesCfg(
+        drive_type="force",
+        stiffness=40.0,
+        damping=5.0,
+        max_force=120.0,
+        max_joint_velocity=7.5,
+    ),
 )
 
 RobotArticulationCfg.anymal_c = _ANYMAL_C_CFG
