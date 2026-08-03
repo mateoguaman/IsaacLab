@@ -203,6 +203,15 @@ RUN chmod 755 \
 # copy the rest of the files
 COPY --chown=isaaclab:isaaclab ../ ${ISAACLAB_PATH}/
 
+# Editable-install a locally rsync'd rsl_rl checkout (a patched fork) if present. It is gitignored
+# so not always in the build context; the full COPY above materializes it when it is. Kept
+# conditional so builds without a local rsl_rl still succeed on the pinned rsl-rl-lib. Must run
+# after the full COPY: the earlier install layer executed before rsl_rl/ was visible.
+RUN if [ -d "${ISAACLAB_PATH}/rsl_rl" ]; then \
+        ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install -e "${ISAACLAB_PATH}/rsl_rl" \
+            --config-settings editable_mode=compat; \
+    fi
+
 # Pre-create every docker-compose named-volume mount point and hand it to the
 # non-root runtime user. docker-compose.yaml is the single source of truth for
 # the list; docker/utils/volume_mounts.py parses it so the paths are not
