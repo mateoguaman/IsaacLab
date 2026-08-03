@@ -57,3 +57,28 @@ class SuccessMonitor:
     def success_update(self, ids_all: torch.Tensor, success_mask: torch.Tensor) -> None:
         """Record boolean success outcomes for the provided slot ids."""
         self._impl.success_update(ids_all, success_mask)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """Return a snapshot of the sliding-window ring-buffer state.
+
+        The caller-owned :attr:`success_rate` tensor is intentionally excluded — its owner
+        (the command term) persists it — so this state round-trips only the ring buffers the
+        monitor itself owns.
+        """
+        return {
+            "success_buf": self.success_buf.clone(),
+            "success_pointer": self.success_pointer.clone(),
+            "success_size": self.success_size.clone(),
+            "success_count": self.success_count.clone(),
+        }
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """Restore the ring-buffer state in place.
+
+        Uses :meth:`torch.Tensor.copy_` so the Warp views (``wp.from_torch``) the warp backend
+        holds over these tensors keep pointing at valid storage after a resume.
+        """
+        self.success_buf.copy_(state["success_buf"])
+        self.success_pointer.copy_(state["success_pointer"])
+        self.success_size.copy_(state["success_size"])
+        self.success_count.copy_(state["success_count"])

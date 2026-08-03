@@ -184,11 +184,16 @@ class PositionLocomotionCRLRunnerCfg(RslRlOffPolicyRunnerCfg):
 
 @configclass
 class PositionRunnerCfg(PresetCfg):
-    """Runner presets: ``presets=crl`` selects CRL, default is PPO."""
+    """Runner presets: ``presets=crl`` selects CRL, ``presets=plr`` selects the PLR runner, default is PPO."""
 
     position = PositionLocomotionPPORunnerCfg()
     rnd = PositionLocomotionRndPPORunnerCfg()
     crl = PositionLocomotionCRLRunnerCfg()
+    # PLR: the standard PPO runner with a level-sampler rollout-push extension. Pairs with the
+    # env-side ``plr`` curriculum preset (which selects the level_sampler_curriculum term).
+    plr = PositionLocomotionPPORunnerCfg().replace(
+        class_type="isaaclab_tasks.core.multi_task.rl.rsl_rl.runners:OnPolicyRunnerWithLevelSampler"
+    )
     default = position
 
 

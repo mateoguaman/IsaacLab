@@ -8,8 +8,14 @@ from isaaclab.utils.configclass import configclass
 
 from isaaclab_tasks.core.multi_task.curriculum import (
     BetaSamplingStrategyCfg,
+    EMAAggregationCfg,
     FrontierSamplingStrategyCfg,
+    GAEMagnitudeScoringCfg,
+    LevelSamplerCfg,
+    ProportionateProposalCfg,
+    RankPrioritizationCfg,
     SamplerCfg,
+    StalenessCfg,
     StateLayoutCfg,
     SuccessMonitorCfg,
     UniformSamplingStrategyCfg,
@@ -95,7 +101,55 @@ class CRLSamplerCfg:
 
 
 @configclass
+class LinearCurriculumCfg:
+    """Monotonic per-env terrain-level ramp baseline (``presets=linear``; quadruped-scoped)."""
+
+    terrain_levels = CurrTerm(
+        func=mdp.linear_terrain_levels,
+        params={
+            "success_rates_bind": "env.command_manager.get_term('goal_point').success_rates",
+            "sample_indices_bind": "env.command_manager.get_term('goal_point').cmd_indices",
+            "success_bind": "env.termination_manager.get_term('success')",
+            "goal_term_name": "goal_point",
+            "success_monitor_cfg": SuccessMonitorCfg(monitored_history_len=100),
+            "demotion_fraction": 0.5,
+        },
+    )
+
+
+@configclass
+class PLRCurriculumCfg:
+    """Prioritized Level Replay curriculum (``presets=plr``).
+
+    Selects the level-sampler curriculum term on the env side. The matching ``plr`` agent preset
+    repoints the runner ``class_type`` to :class:`OnPolicyRunnerWithLevelSampler`, which feeds the
+    per-iteration rollout regret this sampler prioritizes on; without it the sampler never receives
+    scores.
+    """
+
+    terrain_levels = CurrTerm(
+        func=mdp.level_sampler_curriculum,
+        params={
+            "success_rates_bind": "env.command_manager.get_term('goal_point').success_rates",
+            "sample_indices_bind": "env.command_manager.get_term('goal_point').cmd_indices",
+            "success_bind": "env.termination_manager.get_term('success')",
+            "goal_term_name": "goal_point",
+            "success_monitor_cfg": SuccessMonitorCfg(monitored_history_len=100),
+            "sampling": LevelSamplerCfg(
+                scoring=GAEMagnitudeScoringCfg(use_unnormalized=True),
+                aggregation=EMAAggregationCfg(alpha=1.0),
+                prioritization=RankPrioritizationCfg(),
+                staleness=StalenessCfg(),
+                proposal=ProportionateProposalCfg(warmup_threshold=0.0),
+            ),
+        },
+    )
+
+
+@configclass
 class CurriculumPresetCfg(PresetCfg):
     position = PositionCurriculumSamplerCfg()
     crl = CRLSamplerCfg()
+    linear = LinearCurriculumCfg()
+    plr = PLRCurriculumCfg()
     default = position

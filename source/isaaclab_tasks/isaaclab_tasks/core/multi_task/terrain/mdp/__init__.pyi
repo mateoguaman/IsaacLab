@@ -16,6 +16,8 @@ __all__ = [
     "CommandPayloadBaseState",
     "CommandPayloadBaseFootState",
     "success_rate_sampler",
+    "linear_terrain_levels",
+    "level_sampler_curriculum",
     "skip_reward_term",
     "stricten_success_term",
     "activate_reward_term",
@@ -67,7 +69,11 @@ from .commands import (
     TerrainCommands,
     VelocityCommands,
 )
-from isaaclab_tasks.core.multi_task.mdp.curriculums import success_rate_sampler
+from isaaclab_tasks.core.multi_task.mdp.curriculums import (
+    level_sampler_curriculum,
+    linear_terrain_levels,
+    success_rate_sampler,
+)
 from .curriculums import skip_reward_term, stricten_success_term, activate_reward_term
 from isaaclab_tasks.core.multi_task.mdp.observations import (
     command_active,

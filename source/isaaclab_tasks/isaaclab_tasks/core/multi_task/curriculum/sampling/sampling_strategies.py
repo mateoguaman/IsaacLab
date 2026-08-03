@@ -221,3 +221,18 @@ class ValueShiftSamplingStrategy:
 
     def score(self, out: torch.Tensor) -> None:
         out.copy_(self.diff_val)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """Snapshot the critic value-shift buffers so a resume keeps the learned signal.
+
+        Restoring :attr:`cur_val` (the previous-update critic values) means the first
+        post-resume :class:`ValueShiftPPO` update computes a real ``|V_new - V_prev|`` instead
+        of a spurious ``|V_new|`` spike; :attr:`diff_val` keeps the current per-state score so
+        the first resumed rollout samples from the learned distribution.
+        """
+        return {"cur_val": self.cur_val.clone(), "diff_val": self.diff_val.clone()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """Restore the value-shift buffers in place (preserves the ValueShiftPPO aliases)."""
+        self.cur_val.copy_(state["cur_val"])
+        self.diff_val.copy_(state["diff_val"])

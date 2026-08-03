@@ -53,3 +53,16 @@ class Sampler:
     def probabilities_and_sample(self, num_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return probabilities and sampled item indices."""
         return self._impl.probabilities_and_sample(num_samples)
+
+    def state_dict(self) -> dict:
+        """Snapshot per-strategy state that must survive a resume (e.g. ValueShift buffers).
+
+        Returns an empty dict for backends whose strategies are all stateless (the warp
+        backend supports only the stateless Uniform/Beta/Frontier strategies).
+        """
+        return self._impl.state_dict() if hasattr(self._impl, "state_dict") else {}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore per-strategy state produced by :meth:`state_dict`."""
+        if state and hasattr(self._impl, "load_state_dict"):
+            self._impl.load_state_dict(state)

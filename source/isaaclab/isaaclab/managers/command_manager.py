@@ -387,6 +387,23 @@ class CommandManager(ManagerBase):
         """
         return self._terms[name]
 
+    def state_dict(self) -> dict:
+        """Collect serializable state from every command term that exposes ``state_dict``.
+
+        Terms without cross-iteration state (the common case) are silently skipped.
+        """
+        state: dict = {}
+        for name, term in self._terms.items():
+            if hasattr(term, "state_dict"):
+                state[name] = term.state_dict()
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore per-term command state produced by :meth:`state_dict`, matched by name."""
+        for name, term in self._terms.items():
+            if name in state and hasattr(term, "load_state_dict"):
+                term.load_state_dict(state[name])
+
     """
     Helper functions.
     """

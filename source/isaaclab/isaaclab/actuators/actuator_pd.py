@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         DelayedPDActuatorCfg,
         IdealPDActuatorCfg,
         ImplicitActuatorCfg,
+        PaceDCMotorCfg,
         RemotizedPDActuatorCfg,
     )
 
@@ -305,6 +306,58 @@ class DCMotor(IdealPDActuator):
         # clip the torques based on the motor limits
         clamped = torch.clip(effort, min=min_effort, max=max_effort)
         return clamped
+
+
+class PaceDCMotor(DCMotor):
+    """DC-motor model with encoder bias and command-actuation delay.
+
+    The controller receives joint positions in the encoder frame by adding a per-joint encoder
+    bias [rad] to the true joint positions, so the PD law operates on biased positions rather
+    than the simulator's ground-truth positions.
+
+    Computed torques are pushed through a :class:`~isaaclab.utils.DelayBuffer` of length
+    ``max_delay + 1`` to model the latency [sim steps] between command computation and actuation.
+
+    Note:
+        This is an analytic, Lab-side actuator: its encoder bias and torque delay are realized
+        only when :meth:`compute` runs on the PhysX backend. Under the Newton backend the config
+        is treated as a plain DC motor and the bias/delay are not applied.
+    """
+
+    cfg: PaceDCMotorCfg
+
+    def __init__(self, cfg: PaceDCMotorCfg, *args, **kwargs):
+        super().__init__(cfg, *args, **kwargs)
+        if isinstance(cfg.encoder_bias, (list, tuple)) and len(cfg.encoder_bias) != self.num_joints:
+            raise ValueError(
+                f"encoder_bias must have {self.num_joints} elements (one per joint), but got"
+                f" {len(cfg.encoder_bias)}: {cfg.encoder_bias}"
+            )
+        self.encoder_bias = torch.tensor(cfg.encoder_bias, device=self._device).unsqueeze(0).repeat(self._num_envs, 1)
+        self.torques_delay_buffer = DelayBuffer(cfg.max_delay + 1, self._num_envs, device=self._device)
+        self.torques_delay_buffer.set_time_lag(cfg.max_delay, torch.arange(self._num_envs, device=self._device))
+
+    def reset(self, env_ids: Sequence[int]):
+        super().reset(env_ids)
+        self.torques_delay_buffer.reset(env_ids)
+
+    def update_encoder_bias(self, encoder_bias: torch.Tensor):
+        """Replace the cached per-env encoder bias with ``encoder_bias`` [rad]."""
+        self.encoder_bias = encoder_bias
+
+    def update_time_lags(self, delay: int | torch.Tensor, env_ids: Sequence[int] | None = None):
+        """Set the per-env command-to-actuation latency to ``delay`` [sim steps]."""
+        if env_ids is None:
+            env_ids = torch.arange(self._num_envs, device=self._device)
+        self.torques_delay_buffer.set_time_lag(delay, env_ids)
+
+    def compute(
+        self, control_action: ArticulationActions, joint_pos: torch.Tensor, joint_vel: torch.Tensor
+    ) -> ArticulationActions:
+        # PD law sees biased (encoder-frame) joint positions.
+        control_action_sim = super().compute(control_action, joint_pos - self.encoder_bias, joint_vel)
+        control_action_sim.joint_efforts = self.torques_delay_buffer.compute(control_action_sim.joint_efforts)
+        return control_action_sim
 
 
 class DelayedPDActuator(IdealPDActuator):

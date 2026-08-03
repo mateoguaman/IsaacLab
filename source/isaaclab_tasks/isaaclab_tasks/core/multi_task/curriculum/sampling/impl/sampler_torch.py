@@ -67,3 +67,17 @@ class SamplerTorch:
         """Return probabilities and sampled item indices."""
         probs = self.probabilities()
         return probs, self.sample(probs, num_samples)
+
+    def state_dict(self) -> dict:
+        """Collect state from strategies that carry cross-iteration state, keyed by name."""
+        out: dict = {}
+        for name, (strategy, _) in zip(self.names, self.strategies):
+            if hasattr(strategy, "state_dict"):
+                out[name] = strategy.state_dict()
+        return out
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore per-strategy state produced by :meth:`state_dict`."""
+        for name, (strategy, _) in zip(self.names, self.strategies):
+            if name in state and hasattr(strategy, "load_state_dict"):
+                strategy.load_state_dict(state[name])

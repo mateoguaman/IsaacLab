@@ -14,11 +14,13 @@ __all__ = [
     "DelayedPDActuator",
     "IdealPDActuator",
     "ImplicitActuator",
+    "PaceDCMotor",
     "RemotizedPDActuator",
     "DCMotorCfg",
     "DelayedPDActuatorCfg",
     "IdealPDActuatorCfg",
     "ImplicitActuatorCfg",
+    "PaceDCMotorCfg",
     "RemotizedPDActuatorCfg",
 ]
 
@@ -31,6 +33,7 @@ from .actuator_pd import (
     DelayedPDActuator,
     IdealPDActuator,
     ImplicitActuator,
+    PaceDCMotor,
     RemotizedPDActuator,
 )
 from .actuator_pd_cfg import (
@@ -38,5 +41,6 @@ from .actuator_pd_cfg import (
     DelayedPDActuatorCfg,
     IdealPDActuatorCfg,
     ImplicitActuatorCfg,
+    PaceDCMotorCfg,
     RemotizedPDActuatorCfg,
 )

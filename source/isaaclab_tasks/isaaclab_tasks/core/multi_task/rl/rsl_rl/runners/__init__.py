@@ -6,5 +6,6 @@
 """Task-level rsl_rl runners."""
 
 from .off_policy_runner import OffPolicyRunner
+from .on_policy_runner_with_level_sampler import OnPolicyRunnerWithLevelSampler
 
-__all__ = ["OffPolicyRunner"]
+__all__ = ["OffPolicyRunner", "OnPolicyRunnerWithLevelSampler"]

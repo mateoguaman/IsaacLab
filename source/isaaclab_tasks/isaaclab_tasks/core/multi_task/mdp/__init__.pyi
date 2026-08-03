@@ -7,6 +7,8 @@
 
 __all__ = [
     "success_rate_sampler",
+    "linear_terrain_levels",
+    "level_sampler_curriculum",
     "vision_obs",
     "time_left",
     "command_progress",
@@ -28,7 +30,7 @@ __all__ = [
 ]
 
 
-from .curriculums import success_rate_sampler
+from .curriculums import level_sampler_curriculum, linear_terrain_levels, success_rate_sampler
 from .observations import (
     asset_link_velocity_in_root_asset_frame,
     command_active,

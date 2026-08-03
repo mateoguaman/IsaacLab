@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 __all__ = [
+    "AggregationCfg",
+    "AlwaysReplayProposalCfg",
     "BetaSamplingStrategy",
     "BetaSamplingStrategyCfg",
     "ChainedResetTerms",
@@ -24,6 +26,22 @@ __all__ = [
     "UniformSamplingStrategyCfg",
     "ValueShiftSamplingStrategy",
     "ValueShiftSamplingStrategyCfg",
+    "LevelSampler",
+    "LevelSamplerCfg",
+    "RolloutData",
+    "compute_per_env_score",
+    "GAEMagnitudeScoringCfg",
+    "GAESignedScoringCfg",
+    "TD1MagnitudeScoringCfg",
+    "ScoringCfg",
+    "EMAAggregationCfg",
+    "RollingMeanAggregationCfg",
+    "ProportionalPrioritizationCfg",
+    "RankPrioritizationCfg",
+    "PrioritizationCfg",
+    "StalenessCfg",
+    "ProportionateProposalCfg",
+    "ProposalCfg",
     "get_reset_state",
     "reset_accumulator",
     "set_reset_state",
@@ -31,6 +49,26 @@ __all__ = [
 ]
 
 from .event_combinators import ChainedResetTerms, TermChoice, reset_accumulator
+from .plr import (
+    AggregationCfg,
+    AlwaysReplayProposalCfg,
+    EMAAggregationCfg,
+    GAEMagnitudeScoringCfg,
+    GAESignedScoringCfg,
+    LevelSampler,
+    LevelSamplerCfg,
+    PrioritizationCfg,
+    ProportionalPrioritizationCfg,
+    ProportionateProposalCfg,
+    ProposalCfg,
+    RankPrioritizationCfg,
+    RollingMeanAggregationCfg,
+    RolloutData,
+    ScoringCfg,
+    StalenessCfg,
+    TD1MagnitudeScoringCfg,
+    compute_per_env_score,
+)
 from .reset_state import get_reset_state, set_reset_state, temporary_seed
 from .sampling import (
     BetaSamplingStrategy,

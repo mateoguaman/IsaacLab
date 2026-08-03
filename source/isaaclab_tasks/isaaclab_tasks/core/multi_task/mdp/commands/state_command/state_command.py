@@ -75,6 +75,21 @@ class StateCommand(CommandTerm):
         msg += f"\tResampling time range: {self.cfg.resampling_time_range}"
         return msg
 
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """Return the per-task curriculum aggregate so a resume keeps the learned distribution.
+
+        Only :attr:`success_rates` (the per-task success aggregate, shared with the
+        curriculum's success monitor) is persisted. The per-env :attr:`cmd_indices` are
+        intentionally excluded: under Design B envs restart cleanly and resample their goal on
+        the first reset.
+        """
+        return {"success_rates": self.success_rates.clone()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """Restore the per-task success aggregate in place (shared alias with the monitor)."""
+        if "success_rates" in state:
+            self.success_rates.copy_(state["success_rates"])
+
     @property
     def payload(self):
         """The active domain payload (its public methods carry domain semantics)."""

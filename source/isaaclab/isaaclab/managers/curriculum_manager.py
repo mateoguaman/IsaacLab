@@ -163,6 +163,27 @@ class CurriculumManager(ManagerBase):
             raise KeyError(f"Curriculum term '{name}' not found. Active terms: {self._term_names}") from None
         return self._term_cfgs[index].func
 
+    def state_dict(self) -> dict:
+        """Collect serializable state from every term that exposes ``state_dict``.
+
+        Function-based and stateless terms are silently skipped, so the result contains only
+        the terms (e.g. the sampling curriculum) that carry cross-iteration state to
+        round-trip across a resume.
+        """
+        state: dict = {}
+        for name, term_cfg in zip(self._term_names, self._term_cfgs):
+            func = term_cfg.func
+            if hasattr(func, "state_dict"):
+                state[name] = func.state_dict()
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore per-term state produced by :meth:`state_dict`, matched by term name."""
+        for name, term_cfg in zip(self._term_names, self._term_cfgs):
+            func = term_cfg.func
+            if name in state and hasattr(func, "load_state_dict"):
+                func.load_state_dict(state[name])
+
     def get_active_iterable_terms(self, env_idx: int) -> Sequence[tuple[str, Sequence[float]]]:
         """Returns the active terms as iterable sequence of tuples.
 

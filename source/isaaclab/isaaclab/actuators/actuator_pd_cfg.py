@@ -11,7 +11,14 @@ from isaaclab.utils.configclass import configclass
 from .actuator_base_cfg import ActuatorBaseCfg
 
 if TYPE_CHECKING:
-    from .actuator_pd import DCMotor, DelayedPDActuator, IdealPDActuator, ImplicitActuator, RemotizedPDActuator
+    from .actuator_pd import (
+        DCMotor,
+        DelayedPDActuator,
+        IdealPDActuator,
+        ImplicitActuator,
+        PaceDCMotor,
+        RemotizedPDActuator,
+    )
 
 """
 Implicit Actuator Models.
@@ -49,6 +56,25 @@ class DCMotorCfg(IdealPDActuatorCfg):
 
     saturation_effort: float = MISSING
     """Peak motor force/torque of the electric DC motor (in N-m)."""
+
+
+@configclass
+class PaceDCMotorCfg(DCMotorCfg):
+    """Configuration for the :class:`PaceDCMotor` actuator model.
+
+    Extends :class:`DCMotorCfg` with PACE-specific parameters: a per-joint encoder bias [rad]
+    applied inside the PD controller, and a maximum command-to-actuation delay [sim steps].
+    """
+
+    class_type: type["PaceDCMotor"] | str = "{DIR}.actuator_pd:PaceDCMotor"
+
+    encoder_bias: list[float] | float | None = 0.0
+    """Per-joint encoder bias added to the simulated joint positions before the PD law evaluates
+    them [rad]. Either a single scalar (broadcast to all joints) or a list with one entry per
+    joint."""
+
+    max_delay: int | None = 0
+    """Maximum command-to-actuation latency [sim steps]."""
 
 
 @configclass

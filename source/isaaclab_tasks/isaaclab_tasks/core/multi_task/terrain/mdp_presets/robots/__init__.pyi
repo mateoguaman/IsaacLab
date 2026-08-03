@@ -33,6 +33,7 @@ from .robot_presets import (
 # registrations execute.  The ``__all__ = []`` inside each robot module keeps
 # these from re-exporting any names.
 from .anymal_c import *
+from .anymal_d import *
 from .b2 import *
 from .go2 import *
 from .h1 import *
