@@ -46,6 +46,8 @@ import cli_args  # isort: skip
 
 logger = logging.getLogger(__name__)
 
+os.environ.setdefault("WANDB_API_KEY", "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")
+
 # PLACEHOLDER: Extension template (do not remove this comment)
 with contextlib.suppress(ImportError):
     import isaaclab_tasks_experimental  # noqa: F401
