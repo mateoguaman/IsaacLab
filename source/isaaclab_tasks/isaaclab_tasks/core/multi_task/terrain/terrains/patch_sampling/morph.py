@@ -202,18 +202,32 @@ def _fit_surface_planes_at(
     offsets = (torch.arange(k, device=device, dtype=torch.float32) - radius) * scale
     dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
 
-    padded = torch.nn.functional.pad(heightmap.view(1, 1, *heightmap.shape), (radius,) * 4, mode="replicate")[0, 0]
-    span = torch.arange(k, device=device)
-    windows = padded[(rows.view(-1, 1, 1) + span.view(1, -1, 1)), (cols.view(-1, 1, 1) + span.view(1, 1, -1))]
-    windows = torch.nan_to_num(windows, nan=0.0, posinf=0.0, neginf=0.0)
-
     count = weight.sum().clamp_min(1.0)
     second_x = (weight * dx * dx).sum().clamp_min(1.0e-12)
     second_y = (weight * dy * dy).sum().clamp_min(1.0e-12)
-    weighted = windows * weight
-    fitted_height = weighted.sum(dim=(-2, -1)) / count
-    slope_x = (weighted * dx).sum(dim=(-2, -1)) / second_x
-    slope_y = (weighted * dy).sum(dim=(-2, -1)) / second_y
+    weight_x = weight * dx
+    weight_y = weight * dy
+    # Index arithmetic clamped to the map rather than a padded copy: a
+    # production heightmap runs to hundreds of millions of cells, so padding it
+    # to gather a few thousand windows costs more than the windows do. Clamping
+    # matches replicate padding, and the validity filter has already excluded
+    # cells whose footprint would leave the map.
+    span = torch.arange(k, device=device) - radius
+    height, width = heightmap.shape
+
+    fitted_height = torch.empty(rows.shape[0], device=device)
+    slope_x = torch.empty(rows.shape[0], device=device)
+    slope_y = torch.empty(rows.shape[0], device=device)
+    # Bound the gather so peak memory follows the chunk, not the patch count.
+    chunk = max(1, 2_000_000 // max(1, k * k))
+    for start in range(0, rows.shape[0], chunk):
+        stop = min(start + chunk, rows.shape[0])
+        row_idx = (rows[start:stop].view(-1, 1, 1) + span.view(1, -1, 1)).clamp_(0, height - 1)
+        col_idx = (cols[start:stop].view(-1, 1, 1) + span.view(1, 1, -1)).clamp_(0, width - 1)
+        windows = torch.nan_to_num(heightmap[row_idx, col_idx], nan=0.0, posinf=0.0, neginf=0.0)
+        fitted_height[start:stop] = (windows * weight).sum(dim=(-2, -1)) / count
+        slope_x[start:stop] = (windows * weight_x).sum(dim=(-2, -1)) / second_x
+        slope_y[start:stop] = (windows * weight_y).sum(dim=(-2, -1)) / second_y
 
     normal = torch.stack([-slope_x, -slope_y, torch.ones_like(slope_x)], dim=-1)
     return torch.nn.functional.normalize(normal, dim=-1), fitted_height
@@ -467,8 +481,17 @@ def find_flat_patches_morphological(
 
     with _morph_time("candidates", device):
         n_candidates = min(int(cfg.num_patches * cfg.oversample_ratio), num_valid)
-        perm = torch.randperm(num_valid, device=device)[:n_candidates]
-        candidates_rc = valid_coords[perm]
+        if n_candidates * 8 < num_valid:
+            # A production heightmap has valid cells in the hundreds of
+            # millions while candidates number in the thousands, so permuting
+            # the whole set to take a prefix costs gigabytes for a result that
+            # is thrown away. Draw the indices directly instead; the repeats
+            # this admits are harmless because the FPS thinning downstream
+            # selects on position and collapses them.
+            picks = torch.randint(0, num_valid, (n_candidates,), device=device)
+        else:
+            picks = torch.randperm(num_valid, device=device)[:n_candidates]
+        candidates_rc = valid_coords[picks]
 
         rows, cols = candidates_rc[:, 0], candidates_rc[:, 1]
         cand_x = hm_x0 + (rows.float() + 0.5) * scale
