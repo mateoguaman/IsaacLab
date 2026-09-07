@@ -58,15 +58,32 @@ class IKObjectiveTerrainCollisionCfg(IKObjectiveBaseCfg):
 class IKObjectiveStabilityMarginCfg(IKObjectiveBaseCfg):
     """Config for :class:`IKObjectiveStabilityMargin`.
 
-    Reads the CCW foot ordering from :attr:`RetargetPipeline.sampler`
-    so the stability residual's signed-area computation matches the
-    sampler's polygon layout.
+    The support region is the convex hull of the sole outlines of every foot
+    in contact, derived from the robot's own collision geometry, so the
+    objective applies unchanged at any contact count.
     """
 
     class_type: type | str = "{DIR}.stability_margin:IKObjectiveStabilityMargin"
 
     weight: float = 1.0
     """Residual weight [unitless]."""
+
+    contact_height_tol: float = 0.001
+    """How far above its lowest point a foot sample still counts as sole [m].
+
+    Forwarded to
+    :meth:`~isaaclab_tasks.core.multi_task.kinematics.NewtonKinematics.foot_contact_hulls`.
+    Keep it in step with the matching criterion so the solver optimises the
+    same support region the acceptance check enforces.
+    """
+
+    num_directions: int = 16
+    """Probe directions used for the support-function test [unitless].
+
+    The region is bounded by the sampled directions, so a low count admits
+    slightly more than the true hull: the overshoot is ``1 / cos(pi / n) - 1``
+    of the inradius, about 2% at the default.
+    """
 
 
 @configclass

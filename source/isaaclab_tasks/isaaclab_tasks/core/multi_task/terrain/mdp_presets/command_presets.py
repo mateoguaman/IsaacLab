@@ -33,8 +33,14 @@ from ..retarget.feature_extractors import (
 )
 from .robots.robot_presets import (
     FootBodyNamesCfg,
+    RetargetFootContactWeightCfg,
+    RetargetFootRotationWeightCfg,
     RetargetJointRegularizeTargetsCfg,
     RetargetLateralHipJointPatternCfg,
+    RetargetMinContactsCfg,
+    RetargetMorphPatchOversampleCfg,
+    RetargetSnapDistanceCfg,
+    RetargetTerrainCollisionMarginCfg,
 )
 
 
@@ -205,18 +211,28 @@ class CommandsCfg:
                     patch=PatchSamplingCfg(  # this samples foot patch
                         contact_radius=0.04, max_height_diff=0.03, horizontal_scale=0.01, oversample_ratio=5.0
                     ),
-                    sizing=SamplerSizingCfg(fps_features=XYZYawFeatures(yaw_scale=0.1), criteria_yield=0.10),
-                    min_contacts=3,
-                    terrain_snap_distance=0.2,
+                    sizing=SamplerSizingCfg(
+                        fps_features=XYZYawFeatures(yaw_scale=0.1),
+                        criteria_yield=0.10,
+                        morph_patch_oversample=RetargetMorphPatchOversampleCfg(),  # type: ignore[arg-type]
+                    ),
+                    min_contacts=RetargetMinContactsCfg(),  # type: ignore[arg-type]
+                    terrain_snap_distance=RetargetSnapDistanceCfg(),  # type: ignore[arg-type]
                     outward_snap_penalty=1.0,
                 ),
                 foot_body_names=FootBodyNamesCfg(),  # type: ignore[arg-type]
                 lateral_hip_joint_pattern=RetargetLateralHipJointPatternCfg(),  # type: ignore[arg-type]
                 base_pos_weight=0.05,
                 base_rot_weight=0.5,
+                foot_contact_weight=RetargetFootContactWeightCfg(),  # type: ignore[arg-type]
+                foot_rotation_weight=RetargetFootRotationWeightCfg(),  # type: ignore[arg-type]
                 joint_regularize_targets=RetargetJointRegularizeTargetsCfg(),  # type: ignore[arg-type]
                 extra_objectives=[
-                    IKObjectiveTerrainCollisionCfg(weight=2.0, margin=0.05, n_samples=4),
+                    IKObjectiveTerrainCollisionCfg(
+                        weight=2.0,
+                        margin=RetargetTerrainCollisionMarginCfg(),  # type: ignore[arg-type]
+                        n_samples=4,
+                    ),
                     IKObjectiveStabilityMarginCfg(weight=1.0),
                     IKObjectiveGravityTorqueCfg(weight=0.02),
                     IKObjectiveJointDefaultCfg(weight=0.5),

@@ -12,12 +12,41 @@ joint limits), see the per-robot preset modules.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import warp as wp
+
+
+def _quat_to_matrix_xyzw(quat: torch.Tensor) -> torch.Tensor:
+    """Rotation matrices for ``(x, y, z, w)`` quaternions.
+
+    Args:
+        quat: ``[..., 4]`` quaternions in Newton's xyzw order.
+
+    Returns:
+        ``[..., 3, 3]`` rotation matrices.
+    """
+    quat = torch.nn.functional.normalize(quat, dim=-1)
+    x, y, z, w = quat.unbind(-1)
+    return torch.stack(
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(*quat.shape[:-1], 3, 3)
+
 
 if TYPE_CHECKING:
     from ...kinematics import NewtonKinematics
@@ -236,9 +265,10 @@ class SupportPolygonStability:
       negative iff ``p`` is inside the hull.
 
     Args:
-        cfg: :class:`~.criteria_cfg.SupportPolygonStabilityCfg` with
-            ``segment_tol_frac``.
-        pipeline: Unused (kept for uniform construction signature).
+        cfg: :class:`~.criteria_cfg.SupportPolygonStabilityCfg`.
+        pipeline: Live :class:`RetargetPipeline` — read for ``kin`` (to derive
+            each foot's sole outline) and ``foot_body_ids``. When ``None``,
+            feet are treated as point contacts.
         wp_mesh: Unused (kept for uniform construction signature).
     """
 
@@ -248,64 +278,75 @@ class SupportPolygonStability:
         pipeline: RetargetPipeline | None = None,
         wp_mesh: object = None,
     ) -> None:
-        self.segment_tol_frac = 0.05 if cfg is None else cfg.segment_tol_frac
+        from .criteria_cfg import SupportPolygonStabilityCfg as _Cfg
+
+        cfg = _Cfg() if cfg is None else cfg
+        self.margin = cfg.margin
+        self.num_directions = cfg.num_directions
+        self.num_bodies: int | None = None
+        self.foot_ids: list[int] | None = None
+        # Sole outline per foot in the foot's own xy frame. Without a pipeline
+        # the robot's geometry is unknown, so each foot is a single vertex at
+        # its own origin -- a point contact, which the support test below
+        # handles as the degenerate case of a hull.
+        self._hull_local_np = np.zeros((1, 1, 2), dtype=np.float32)
+        if pipeline is not None:
+            self.num_bodies = pipeline.kin.model.body_count
+            self.foot_ids = list(pipeline.foot_body_ids)
+            self._hull_local_np = pipeline.kin.foot_contact_hulls(self.foot_ids, height_tol=cfg.contact_height_tol)[
+                "vertices"
+            ]
+        self._hull_local: torch.Tensor | None = None
+        self._directions: torch.Tensor | None = None
+
+    def _cached(self, device: torch.device, nc: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the per-foot sole hulls and probe directions on ``device``."""
+        if self._hull_local is None or self._hull_local.device != device:
+            hull = torch.as_tensor(self._hull_local_np, dtype=torch.float32, device=device)
+            if hull.shape[0] == 1 and nc > 1:
+                hull = hull.expand(nc, -1, -1)
+            self._hull_local = hull.contiguous()
+            angles = torch.arange(self.num_directions, dtype=torch.float32, device=device)
+            angles *= 2.0 * math.pi / self.num_directions
+            self._directions = torch.stack([angles.cos(), angles.sin()], dim=-1)
+        return self._hull_local, self._directions  # type: ignore[return-value]
 
     def __call__(self, buffer: RetargetBuffer, N: int) -> torch.Tensor:
         nc = buffer.num_contacts
-        ct_xy = buffer.contact_targets_t[: N * nc].view(N, nc, 3)[..., :2]
-        base_xy = buffer.joint_q_result_t[:N, 0:2]
-        is_contact = buffer.is_contact_t[: N * nc].view(N, nc)
-        n_active = is_contact.sum(dim=-1)  # [N]
-
-        result = torch.zeros(N, device=buffer.device, dtype=torch.bool)
+        device = buffer.device
         if N == 0:
-            return result
+            return torch.zeros(0, device=device, dtype=torch.bool)
 
-        # Group candidates by their per-candidate active-contact count and
-        # dispatch to the right support-region test. ``nc`` is small
-        # (typically <= 4) so this loop is constant-cost.
-        for k in range(2, nc + 1):
-            mask_k = n_active == k
-            if not bool(mask_k.any()):
-                continue
-            idx_k = mask_k.nonzero(as_tuple=False).squeeze(-1)
-            ct_k = ct_xy[idx_k]  # [Nk, nc, 2]
-            base_k = base_xy[idx_k]  # [Nk, 2]
-            is_k = is_contact[idx_k]  # [Nk, nc]
-            # Sort active slots to the front; contiguous ``[:, :k]`` slice
-            # then gives only the active contacts in a stable order.
-            sort_idx = is_k.to(torch.int32).argsort(dim=-1, descending=True, stable=True)
-            active = torch.gather(ct_k, 1, sort_idx.unsqueeze(-1).expand(-1, -1, 2))[:, :k]
+        hull_local, directions = self._cached(torch.device(device), nc)
+        num_vertices = hull_local.shape[1]
 
-            if k == 2:
-                a = active[:, 0]
-                b = active[:, 1]
-                seg = b - a
-                to_p = base_k - a
-                seg_len_sq = (seg * seg).sum(dim=-1).clamp_min(1.0e-12)
-                t = (to_p * seg).sum(dim=-1) / seg_len_sq
-                perp = seg[..., 0] * to_p[..., 1] - seg[..., 1] * to_p[..., 0]
-                seg_len = seg_len_sq.sqrt()
-                perp_abs = perp.abs() / seg_len
-                ok = (t >= 0.0) & (t <= 1.0) & (perp_abs <= self.segment_tol_frac * seg_len)
-            else:
-                centroid = active.mean(dim=1, keepdim=True)
-                angles = torch.atan2(
-                    active[..., 1] - centroid[..., 1],
-                    active[..., 0] - centroid[..., 0],
-                )
-                order = angles.argsort(dim=1)
-                poly = torch.gather(active, 1, order.unsqueeze(-1).expand(-1, -1, 2))
-                v0 = poly
-                v1 = torch.roll(poly, -1, dims=1)
-                edge = v1 - v0
-                to_p = base_k.unsqueeze(1) - v0
-                cross = edge[..., 0] * to_p[..., 1] - edge[..., 1] * to_p[..., 0]
-                ok = (cross >= 0).all(dim=1)
+        contact_xy = buffer.contact_targets_t[: N * nc].view(N, nc, 3)[..., :2]
+        is_contact = buffer.is_contact_t[: N * nc].view(N, nc)
+        com_xy = buffer.joint_q_result_t[:N, 0:2]
 
-            result[idx_k] = ok
+        # Place each foot's sole outline in the world. Only the horizontal
+        # projection bears load, so the foot's rotation is applied and the xy
+        # block taken -- a tilted foot correctly presents a foreshortened
+        # outline rather than its full footprint.
+        if self.foot_ids is not None and self.num_bodies is not None:
+            body_q = buffer.body_q_t[: N * self.num_bodies].view(N, self.num_bodies, 7)
+            foot_index = torch.as_tensor(self.foot_ids, device=device, dtype=torch.long)
+            rotation_xy = _quat_to_matrix_xyzw(body_q[:, foot_index, 3:7])[..., :2, :2]
+            offsets = torch.einsum("nfij,fvj->nfvi", rotation_xy, hull_local)
+        else:
+            offsets = hull_local.unsqueeze(0).expand(N, -1, -1, -1)
+        vertices = (contact_xy.unsqueeze(2) + offsets).reshape(N, nc * num_vertices, 2)
 
-        return result
+        # Support-function test. For every probe direction, compare how far the
+        # support region reaches against how far the CoM sits. The smallest gap
+        # is the signed distance from the CoM to the region's boundary, so it
+        # doubles as the stability margin and needs no hull ordering -- which
+        # matters because most sole vertices lie strictly inside the region.
+        active = is_contact.unsqueeze(-1).expand(N, nc, num_vertices).reshape(N, nc * num_vertices)
+        projection = vertices @ directions.T
+        projection = torch.where(active.unsqueeze(-1), projection, torch.full_like(projection, -torch.inf))
+        support = projection.amax(dim=1)
+        return (support - com_xy @ directions.T).amin(dim=-1) >= self.margin
 
 
 class SolverCostOutlier:

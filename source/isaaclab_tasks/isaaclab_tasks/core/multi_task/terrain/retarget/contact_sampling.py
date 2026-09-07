@@ -36,8 +36,8 @@ import warp as wp
 
 from ...kinematics import NewtonKinematics
 from ...utils.grid_downsample import grid_bucket_downsample
-from ..terrains.patch_sampling.cfg import CircleFootprintCfg, MorphologicalPatchSamplingCfg
-from ..terrains.patch_sampling.morph import MORPH_TIMINGS
+from ..terrains.patch_sampling.cfg import CircleFootprintCfg, MorphologicalPatchSamplingCfg, RectFootprintCfg
+from ..terrains.patch_sampling.morph import MORPH_TIMINGS, MORPH_YAW_BINS
 from .buffer import RetargetBuffer
 from .canonical_shape import canonicalize_shape
 from .cfg import PatchSamplingCfg, SamplerCfg, SamplerSizingCfg
@@ -181,6 +181,29 @@ class Sampler(SamplerBase):
         # measured in the polygon-centroid frame.
         self._compute_foot_reachability()
 
+    def _patch_footprint(self):
+        """Footprint the flatness filter should test terrain against.
+
+        A sole with real extent only rests flat where the surface is flat over
+        that whole extent, and for a non-square sole which headings fit depends
+        on the terrain, so the foot's own outline is used when it is elongated
+        enough for orientation to matter. A near-circular foot is reported as a
+        disc, which keeps the filter yaw-invariant and cheap.
+        """
+        hull = self.kin.foot_contact_hulls(self.foot_body_ids)
+        extent = hull["vertices"].max(axis=1) - hull["vertices"].min(axis=1)  # [nc, 2]
+        length = float(extent[:, 0].max())
+        width = float(extent[:, 1].max())
+        contact_radius = float(self.cfg.patch.contact_radius)
+        if max(length, width) < 2.0 * contact_radius or max(length, width) <= 0.0:
+            return CircleFootprintCfg(radius=contact_radius)
+        longer, shorter = max(length, width), min(length, width)
+        if longer < 1.5 * shorter:
+            # Roughly square: a disc inscribed in it says the same thing about
+            # flatness without paying for eight rotated masks.
+            return CircleFootprintCfg(radius=0.5 * shorter)
+        return RectFootprintCfg(length=longer, width=shorter)
+
     def _compute_foot_reachability(self, seed: int = 0) -> None:
         """Build the canonical FK shape library and derived scalars.
 
@@ -290,16 +313,26 @@ class Sampler(SamplerBase):
         # across the chassis. Mirrored templates would seed IK into a
         # legs-across-body basin even though ``tgt_perm == tpl_perm`` at
         # query time.
+        nc = len(self.foot_body_ids)
         xy = foot_xyz[..., :2]
         centroid = xy.mean(dim=1, keepdim=True)
         rel_xy = xy - centroid
         angles = torch.atan2(rel_xy[..., 1], rel_xy[..., 0])
         order_ccw = angles.argsort(dim=-1)
-        sorted_xy = torch.gather(xy, 1, order_ccw.unsqueeze(-1).expand(-1, -1, 2))
-        edges = sorted_xy.roll(-1, dims=1) - sorted_xy
-        next_edges = edges.roll(-1, dims=1)
-        cross = edges[..., 0] * next_edges[..., 1] - edges[..., 1] * next_edges[..., 0]
-        hull_convex = (cross > 0).all(dim=-1) | (cross < 0).all(dim=-1)  # [n_samples]
+        if nc >= 3:
+            sorted_xy = torch.gather(xy, 1, order_ccw.unsqueeze(-1).expand(-1, -1, 2))
+            edges = sorted_xy.roll(-1, dims=1) - sorted_xy
+            next_edges = edges.roll(-1, dims=1)
+            cross = edges[..., 0] * next_edges[..., 1] - edges[..., 1] * next_edges[..., 0]
+            hull_convex = (cross > 0).all(dim=-1) | (cross < 0).all(dim=-1)  # [n_samples]
+        else:
+            # Fewer than three feet enclose no area, so every failure the
+            # convexity walk detects -- a self-intersecting boundary, or a foot
+            # sitting inside the others -- cannot arise. Its cross products are
+            # identically zero here, which would reject every sample; the
+            # ordering check below is what catches the crossed-leg stances that
+            # actually matter for a biped.
+            hull_convex = torch.ones(xy.shape[0], dtype=torch.bool, device=xy.device)
 
         # Nominal slot→CCW-rank permutation (the robot's "correct" layout).
         nominal_perm = self._nominal_angle_t.argsort()  # [nc]
@@ -405,7 +438,7 @@ class Sampler(SamplerBase):
         with self._time("morph"):
             fc_cfg = MorphologicalPatchSamplingCfg(
                 num_patches=num_patches,
-                footprint=CircleFootprintCfg(radius=patch.contact_radius),
+                footprint=self._patch_footprint(),
                 max_height_diff=patch.max_height_diff,
                 horizontal_scale=patch.horizontal_scale,
                 oversample_ratio=patch.oversample_ratio,
@@ -417,6 +450,11 @@ class Sampler(SamplerBase):
             origin_t = torch.tensor(origin, dtype=torch.float, device=dev_str)
             fp[:, :3] += origin_t
             patch_pts = fp[:, :3].contiguous()  # [N_p, 3]
+            # Orientation the surface demands of anything resting here, plus
+            # which headings the footprint fits. Both ride along to the fused
+            # kernel so a foot is matched to a patch it can actually lie on.
+            patch_quats = fp[:, 3:7].contiguous()  # [N_p, 4] xyzw
+            patch_admissible = fp[:, 7].to(torch.int32).contiguous()  # [N_p]
         for _sub_name, _sub_dt in MORPH_TIMINGS.items():
             key = f"morph.{_sub_name}"
             self.sub_timings[key] = self.sub_timings.get(key, 0.0) + _sub_dt
@@ -461,6 +499,9 @@ class Sampler(SamplerBase):
                 seed=42,
                 K=K,
                 patch_pts=patch_pts,
+                patch_quats=patch_quats,
+                patch_admissible=patch_admissible,
+                num_yaw_bins=MORPH_YAW_BINS,
                 fk_shape_samples=self._fk_shape_samples,
                 nominal_angles=self._nominal_angle_t,
                 radius=radius,
@@ -483,6 +524,7 @@ class Sampler(SamplerBase):
             tpl_idx = outputs["tpl_idx"]
             is_contact_full = outputs["is_contact_full"]
             contact_ik = outputs["contact_ik"]
+            contact_rot = outputs["contact_rot"]
             n_found = outputs["n_found"]
             no_convex = outputs["no_convex"]
 
@@ -523,6 +565,7 @@ class Sampler(SamplerBase):
 
         with self._time("prepare_ik"):
             v_contact = contact_ik[valid_idx].contiguous()  # [n_valid, nc, 3]
+            v_contact_rot = contact_rot[valid_idx].contiguous()  # [n_valid, nc, 4]
             is_contact_ik = is_contact_full[valid_idx].contiguous()
             centroid_sel = v_contact.mean(dim=-2)
             v_base = torch.stack(
@@ -539,6 +582,9 @@ class Sampler(SamplerBase):
 
             n_ik = v_contact.shape[0]
             _prepare_ik_batched(v_contact, v_base, v_yaw, jq_rev_seed, buffer)
+            # Orientation each foot must adopt to lie on its patch, kept
+            # beside the position target for the rotation objective.
+            buffer.contact_target_rot_t[: n_ik * nc] = v_contact_rot.reshape(-1, 4)
             buffer._geom_valid[:n_ik] = True
             buffer.num_written = n_ik
             buffer.num_geometry_valid = n_ik

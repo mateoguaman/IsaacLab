@@ -124,6 +124,94 @@ class RetargetLateralHipJointPatternCfg(PresetCfg):
 
 
 @configclass
+class RetargetTerrainCollisionMarginCfg(PresetCfg):
+    """Clearance the retarget IK keeps between non-foot bodies and the terrain [m].
+
+    Consumed by :attr:`IKObjectiveTerrainCollisionCfg.margin`. The usable value
+    is bounded by the robot's own geometry: any non-foot body that already sits
+    closer than this to the ground when standing gets pushed away from it, which
+    lifts the attached foot and fights the contact targets. Shins and ankle
+    links on a humanoid sit far lower than a quadruped's, so the ceiling is much
+    tighter there.
+
+    ``scripts/audit_collision_geometry.py`` reports each body's standing
+    clearance and flags the ones a given margin would disturb.
+    """
+
+    default: float = 0.05
+
+
+@configclass
+class RetargetFootContactWeightCfg(PresetCfg):
+    """Weight holding each foot on its contact target [unitless].
+
+    Consumed by :attr:`RetargetPipelineCfg.foot_contact_weight`. Applied per
+    foot, so the pull defending the stance totals this times the foot count
+    while everything it competes against is independent of that count. A
+    two-footed robot therefore needs roughly twice a quadruped's value to
+    hold its contacts equally well.
+    """
+
+    default: float = 1.0
+
+
+@configclass
+class RetargetFootRotationWeightCfg(PresetCfg):
+    """Weight holding each contact foot flat on its patch [unitless].
+
+    Consumed by :attr:`RetargetPipelineCfg.foot_rotation_weight`. A sole with
+    real extent has to match the surface under it or its corners drive into
+    the terrain, so a flat-footed robot needs this; a point foot has no sole
+    to keep flat and leaves it at zero.
+    """
+
+    default: float = 0.0
+
+
+@configclass
+class RetargetSnapDistanceCfg(PresetCfg):
+    """How far a foot may move to reach a contact patch [m].
+
+    Consumed by :attr:`SamplerCfg.terrain_snap_distance`. Beyond this a
+    foot is reported airborne instead of snapped. The useful value scales
+    with the robot: a fifth of a metre is a small fraction of a quadruped's
+    stance but most of a humanoid's, where it lets feet claim patches the
+    legs cannot reach. It also cannot go below the patch spacing, or feet
+    find nothing to stand on -- see :class:`RetargetMorphPatchOversampleCfg`.
+    """
+
+    default: float = 0.2
+
+
+@configclass
+class RetargetMinContactsCfg(PresetCfg):
+    """Contact slots a sampled stance must fill to be accepted [unitless].
+
+    Consumed by :attr:`SamplerCfg.min_contacts`. Reaching the foot count
+    makes every foot snap to a patch, which for two feet means the sampler
+    can never report one as airborne even where no patch fits it. Allowing
+    fewer lets it say so, and single-support stances are valid support
+    regions in their own right once the sole outline is modelled.
+    """
+
+    default: int = 3
+
+
+@configclass
+class RetargetMorphPatchOversampleCfg(PresetCfg):
+    """Terrain contact patches sampled per foot slot per placement [unitless].
+
+    Consumed by :attr:`SamplerSizingCfg.morph_patch_oversample`. Because the
+    budget is per foot slot, a two-footed robot ends up with half the patches
+    over the same ground as a quadruped, leaving each foot a coarser grid to
+    snap onto. Raising it restores the spatial density, which is what decides
+    how far a foot has to move from its sampled stance to reach a patch.
+    """
+
+    default: float = 4.0
+
+
+@configclass
 class RetargetJointRegularizeTargetsCfg(PresetCfg):
     """Per-robot joint-name regex -> target-angle dict for retarget IK.
 

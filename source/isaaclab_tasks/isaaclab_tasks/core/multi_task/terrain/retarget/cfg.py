@@ -380,12 +380,35 @@ class RetargetPipelineCfg:
     with other workloads whose footprint is hard to predict.
     """
 
+    foot_contact_weight: float = 1.0
+    """Weight of each foot's contact-position IK objective [unitless].
+
+    Applied *per foot*, so the pull holding the stance onto its contact targets
+    totals ``foot_contact_weight × num_feet`` while everything it competes
+    against -- joint limits, terrain collision, stability, joint defaults, base
+    pose -- is independent of foot count. A two-footed robot therefore defends
+    its contacts with half the weight a quadruped does unless this is raised.
+    """
+
+    foot_rotation_weight: float = 0.0
+    """Weight of each contact foot's orientation IK objective [unitless].
+
+    Holds the sole against the surface it stands on: the target is the plane
+    fitted under its contact patch, so on sloped or uneven ground the foot
+    tilts to match rather than pivoting into it. Position alone leaves rotation
+    free, which is harmless for a point foot and lets a sole with real extent
+    drive its corners through the terrain.
+
+    ``0.0`` disables the objective, which is the right default for point-footed
+    robots that have no sole to keep flat.
+    """
+
     base_pos_weight: float = 0.05
     """Weight of the base-position IK objective [unitless].
 
     Keeps the IK near the sampler's plane-fit base position. Small by
-    default so the foot-contact targets (weight 1.0) dominate -- the
-    base is a soft anchor, not a hard target.
+    default so the foot-contact targets dominate -- the base is a soft
+    anchor, not a hard target.
     """
 
     base_rot_weight: float = 0.5

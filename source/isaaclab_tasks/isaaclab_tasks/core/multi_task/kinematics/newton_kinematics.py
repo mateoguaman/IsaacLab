@@ -7,13 +7,15 @@
 
 Wraps :class:`newton.Model` behind a single :class:`NewtonKinematics`
 object that owns the model, ordered body/joint names, and default stance.
-The USD is parsed exactly once in ``__init__``.
+The description file is parsed exactly once in ``__init__``; both USD and
+URDF sources are accepted.
 
 No IsaacSim dependency -- only Newton + Warp.
 """
 
 from __future__ import annotations
 
+import math
 import re
 
 import newton
@@ -25,7 +27,123 @@ from newton._src.sim.ik.ik_common import eval_fk_batched as _newton_eval_fk_batc
 
 from .newton_kinematics_cfg import NewtonKinematicsCfg  # re-exported for backcompat
 
-__all__ = ["NewtonKinematics", "NewtonKinematicsCfg"]
+__all__ = ["NewtonKinematics", "NewtonKinematicsCfg", "add_robot_description"]
+
+
+def add_robot_description(
+    builder: newton.ModelBuilder,
+    path: str,
+    collapse_fixed_joints: bool = False,
+    show_colliders: bool = False,
+) -> list[str]:
+    """Add a robot description to ``builder`` and return its body names.
+
+    Accepts USD or URDF. The two Newton loaders differ in more than the file
+    they read: ``add_urdf`` defaults to a fixed base and reports nothing back,
+    whereas ``add_usd`` returns prim-path maps. Both are normalised here so
+    callers get a floating-base articulation and ordered body names either way.
+
+    Args:
+        builder: Model builder to add the articulation to.
+        path: Path to a ``.usd``/``.usda`` or ``.urdf`` description.
+        collapse_fixed_joints: Merge fixed joints into their parent body.
+        show_colliders: Render collision geometry in place of visual meshes.
+            Only honoured for URDF sources.
+
+    Returns:
+        Body names ordered to match the builder's body indices.
+    """
+    if path.lower().endswith(".urdf"):
+        builder.add_urdf(
+            path,
+            floating=True,
+            collapse_fixed_joints=collapse_fixed_joints,
+            hide_visuals=show_colliders,
+            force_show_colliders=show_colliders,
+        )
+        return [label.rsplit("/", 1)[-1] for label in builder.body_label]
+
+    result = builder.add_usd(path, collapse_fixed_joints=collapse_fixed_joints)
+    path_body_map: dict[str, int] = result.get("path_body_map", {})
+    names = [""] * (max(path_body_map.values(), default=-1) + 1)
+    for prim_path, index in path_body_map.items():
+        names[index] = prim_path.rsplit("/", 1)[-1]
+    return names
+
+
+def _fibonacci_sphere(n: int) -> np.ndarray:
+    """``n`` approximately-uniform points on the unit sphere."""
+    if n <= 1:
+        return np.array([[0.0, 0.0, -1.0]])
+    index = np.arange(n, dtype=float)
+    y = 1.0 - 2.0 * index / float(n - 1)
+    radius = np.sqrt(np.maximum(0.0, 1.0 - y * y))
+    theta = np.pi * (3.0 - np.sqrt(5.0)) * index
+    return np.stack([np.cos(theta) * radius, y, np.sin(theta) * radius], axis=-1)
+
+
+def _convex_hull_2d(points: np.ndarray) -> np.ndarray:
+    """Counter-clockwise convex hull of 2D ``points``, via monotone chain.
+
+    Degenerate inputs are handled the way callers want: a single cluster
+    collapses to one vertex and a collinear set to its two extremes, so
+    point-like feet need no special case.
+
+    Args:
+        points: ``[N, 2]`` planar points [m].
+
+    Returns:
+        ``[H, 2]`` hull vertices in counter-clockwise order.
+    """
+    unique = np.unique(np.asarray(points, dtype=np.float64).reshape(-1, 2), axis=0)
+    if len(unique) <= 2:
+        return unique.astype(np.float32)
+
+    order = np.lexsort((unique[:, 1], unique[:, 0]))
+    ordered = unique[order]
+
+    def _half(seq: np.ndarray) -> list[np.ndarray]:
+        chain: list[np.ndarray] = []
+        for point in seq:
+            while len(chain) >= 2:
+                a, b = chain[-2], chain[-1]
+                if (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0]) > 0.0:
+                    break
+                chain.pop()
+            chain.append(point)
+        return chain
+
+    lower = _half(ordered)
+    upper = _half(ordered[::-1])
+    hull = np.array(lower[:-1] + upper[:-1], dtype=np.float32)
+    return hull if len(hull) else ordered[:1].astype(np.float32)
+
+
+def _thin_hull(hull: np.ndarray, max_vertices: int) -> np.ndarray:
+    """Reduce ``hull`` to ``max_vertices`` by repeatedly dropping the flattest corner.
+
+    The dropped vertex is the one nearest the line joining its neighbours, so
+    each removal moves the outline as little as possible.
+
+    Args:
+        hull: ``[H, 2]`` counter-clockwise hull vertices [m].
+        max_vertices: Number of vertices to keep.
+
+    Returns:
+        ``[max_vertices, 2]`` thinned hull, still counter-clockwise.
+    """
+    kept = [np.asarray(v, dtype=np.float64) for v in hull]
+    while len(kept) > max_vertices:
+        deviations = []
+        for i in range(len(kept)):
+            previous, current, following = kept[i - 1], kept[i], kept[(i + 1) % len(kept)]
+            edge = following - previous
+            edge_length = float(np.hypot(edge[0], edge[1]))
+            offset = current - previous
+            cross = abs(edge[0] * offset[1] - edge[1] * offset[0])
+            deviations.append(cross / edge_length if edge_length > 1.0e-12 else float(np.hypot(*offset)))
+        kept.pop(int(np.argmin(deviations)))
+    return np.asarray(kept, dtype=np.float32)
 
 
 class NewtonKinematics:
@@ -55,20 +173,27 @@ class NewtonKinematics:
         self.usd_path = str(cfg.usd_path)
 
         self.builder = newton.ModelBuilder()
-        result = self.builder.add_usd(self.usd_path, collapse_fixed_joints=cfg.collapse_fixed_joints)
-        self.model = self.builder.finalize(device=cfg.device)
+        if self.usd_path.lower().endswith(".urdf"):
+            self.body_names = add_robot_description(
+                self.builder, self.usd_path, collapse_fixed_joints=cfg.collapse_fixed_joints
+            )
+            self.model = self.builder.finalize(device=cfg.device)
+            self.joint_names = [label.rsplit("/", 1)[-1] for label in self.builder.joint_label]
+        else:
+            result = self.builder.add_usd(self.usd_path, collapse_fixed_joints=cfg.collapse_fixed_joints)
+            self.model = self.builder.finalize(device=cfg.device)
 
-        path_body_map: dict[str, int] = result.get("path_body_map", {})
-        names = [""] * self.model.body_count
-        for path, idx in path_body_map.items():
-            names[idx] = path.rsplit("/", 1)[-1]
-        self.body_names = names
+            path_body_map: dict[str, int] = result.get("path_body_map", {})
+            names = [""] * self.model.body_count
+            for path, idx in path_body_map.items():
+                names[idx] = path.rsplit("/", 1)[-1]
+            self.body_names = names
 
-        path_joint_map: dict[str, int] = result.get("path_joint_map", {})
-        jnames = [""] * self.model.joint_count
-        for path, idx in path_joint_map.items():
-            jnames[idx] = path.rsplit("/", 1)[-1]
-        self.joint_names = jnames
+            path_joint_map: dict[str, int] = result.get("path_joint_map", {})
+            jnames = [""] * self.model.joint_count
+            for path, idx in path_joint_map.items():
+                jnames[idx] = path.rsplit("/", 1)[-1]
+            self.joint_names = jnames
 
         # Root coordinate count: 7 for a free-floating base (3 position + 4
         # quaternion), 0 for a fixed base. Non-root joints occupy
@@ -213,8 +338,7 @@ class NewtonKinematics:
 
         # Per-foot local-z-min from attached collision shapes. For each
         # shape type, compute the lowest-z offset the shape reaches in the
-        # body frame (rotation assumed identity -- matches every foot
-        # geometry we've seen in practice).
+        # body frame, honouring the shape's own rotation.
         builder = self.builder
         foot_ids_set = set(int(f) for f in foot_body_ids)
         z_min_local: float | None = None
@@ -246,6 +370,168 @@ class NewtonKinematics:
             "foot_ground_offset": foot_ground_offset,
         }
 
+    def foot_contact_hulls(
+        self,
+        foot_body_ids: list[int],
+        height_tol: float = 0.001,
+        max_vertices: int = 8,
+        samples_per_shape: int = 128,
+    ) -> dict[str, np.ndarray]:
+        """Per-foot sole outline, as a 2D convex hull in the foot's own frame.
+
+        Samples the surface of every collision shape attached to each foot,
+        keeps the points lying within :paramref:`height_tol` of that foot's
+        lowest point, and returns the convex hull of their xy projection. This
+        is the patch of the foot that can bear load on flat ground, so it is
+        what the support region should be built from.
+
+        The result is derived from whatever collision geometry the robot
+        ships, so it needs no per-robot constants and degenerates on its own:
+        a spherical foot yields a hull barely wider than a point, while a flat
+        humanoid sole yields its full outline.
+
+        Args:
+            foot_body_ids: Newton body indices for the feet.
+            height_tol: How far above a foot's lowest point a sample may sit
+                and still count as sole [m], standing in for how far the foot
+                deforms under load. A flat sole is insensitive to it (G1
+                measures 20.5 cm at 0.2 mm and 20.8 cm at 5 mm), while a
+                curved one scales with it (ANYmal-C's spherical foot spans
+                0.6 cm at 0.2 mm and 3.4 cm at 5 mm), which is the intended
+                distinction between a foot that lies flat and one that
+                touches at a point.
+            max_vertices: Upper bound on hull vertices retained per foot.
+                Hulls with more are thinned corner by corner; hulls with fewer
+                repeat their last vertex as padding.
+            samples_per_shape: Surface samples drawn per collision shape.
+
+        Returns:
+            Dict with ``vertices`` (``[n_feet, max_vertices, 2]`` xy offsets in
+            the foot frame [m]), ``counts`` (``[n_feet]`` real vertex count
+            before padding), and ``sole_z`` (``[n_feet]`` body-frame z of each
+            foot's contact plane [m]).
+
+        Raises:
+            ValueError: If a foot body carries no usable collision geometry.
+        """
+        builder = self.builder
+        body_shapes: dict[int, list[int]] = {}
+        for si in range(len(builder.shape_body)):
+            body_shapes.setdefault(int(builder.shape_body[si]), []).append(si)
+
+        vertices = np.zeros((len(foot_body_ids), max_vertices, 2), dtype=np.float32)
+        counts = np.zeros(len(foot_body_ids), dtype=np.int32)
+        sole_z = np.zeros(len(foot_body_ids), dtype=np.float32)
+
+        for slot, body_id in enumerate(foot_body_ids):
+            points: list[np.ndarray] = []
+            for si in body_shapes.get(int(body_id), []):
+                sampled = self._shape_surface_points(
+                    int(builder.shape_type[si]),
+                    builder.shape_scale[si],
+                    builder.shape_transform[si],
+                    builder.shape_source[si],
+                    samples_per_shape,
+                )
+                if sampled is not None and len(sampled):
+                    points.append(sampled)
+            if not points:
+                name = self.body_names[int(body_id)]
+                raise ValueError(f"Foot body '{name}' has no collision geometry to derive a contact hull from.")
+
+            cloud = np.concatenate(points, axis=0)
+            z_min = float(cloud[:, 2].min())
+            sole = cloud[cloud[:, 2] <= z_min + height_tol]
+            hull = _convex_hull_2d(sole[:, :2])
+            if len(hull) > max_vertices:
+                hull = _thin_hull(hull, max_vertices)
+
+            counts[slot] = len(hull)
+            sole_z[slot] = z_min
+            vertices[slot, : len(hull)] = hull
+            # Pad by repeating the last vertex. Consumers take a maximum over
+            # vertices, which duplicates leave unchanged, so padding needs no
+            # masking at the use site.
+            vertices[slot, len(hull) :] = hull[-1]
+
+        return {"vertices": vertices, "counts": counts, "sole_z": sole_z}
+
+    @staticmethod
+    def _shape_surface_points(
+        shape_type: int,
+        shape_scale,
+        shape_transform,
+        shape_source,
+        n_samples: int,
+    ) -> np.ndarray | None:
+        """Surface samples of one collision shape, in body frame [m].
+
+        Applies the shape's full transform, rotation included, so shapes
+        attached at an angle land where they actually are.
+
+        Returns ``None`` for geometry types this does not model.
+        """
+        xform = np.asarray(shape_transform, dtype=float).reshape(-1)
+        translation = xform[:3]
+        rotation = NewtonKinematics._rotation_matrix(xform[3:7])
+        scale = np.asarray(shape_scale, dtype=float).reshape(-1)
+
+        def to_body(local: np.ndarray) -> np.ndarray:
+            return local @ rotation.T + translation
+
+        if shape_type in (int(GeoType.MESH), int(GeoType.CONVEX_MESH)):
+            if shape_source is None or not hasattr(shape_source, "vertices"):
+                return None
+            verts = np.asarray(shape_source.vertices, dtype=float).reshape(-1, 3)
+            if verts.size == 0:
+                return None
+            return to_body(verts * scale[:3])
+
+        if shape_type == int(GeoType.SPHERE):
+            return to_body(_fibonacci_sphere(n_samples) * float(scale[0]))
+
+        if shape_type == int(GeoType.BOX):
+            half = 0.5 * scale[:3]
+            signs = np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3)
+            return to_body(signs * half)
+
+        if shape_type in (int(GeoType.CAPSULE), int(GeoType.CYLINDER)):
+            radius, half_height = float(scale[0]), float(scale[1])
+            n_angular = max(8, int(math.sqrt(n_samples)) * 2)
+            n_axial = max(2, n_samples // n_angular)
+            angles = np.linspace(0.0, 2.0 * np.pi, n_angular, endpoint=False)
+            rim = np.stack([radius * np.cos(angles), radius * np.sin(angles)], axis=-1)
+            # Lateral surface: the load-bearing face when the shape lies on its
+            # side, which end-cap samples alone would miss.
+            axial = np.linspace(-half_height, half_height, n_axial)
+            lateral = np.concatenate(
+                [np.column_stack([rim, np.full(n_angular, z)]) for z in axial],
+                axis=0,
+            )
+            if shape_type == int(GeoType.CAPSULE):
+                cap = _fibonacci_sphere(max(8, n_samples // 4)) * radius
+                caps = np.concatenate([cap + [0.0, 0.0, half_height], cap - [0.0, 0.0, half_height]], axis=0)
+                return to_body(np.concatenate([lateral, caps], axis=0))
+            return to_body(lateral)
+
+        return None
+
+    @staticmethod
+    def _rotation_matrix(quat_xyzw) -> np.ndarray:
+        """Return the 3x3 rotation matrix for a Newton ``(x, y, z, w)`` quaternion."""
+        x, y, z, w = (float(v) for v in np.asarray(quat_xyzw, dtype=float).reshape(-1)[:4])
+        norm = math.sqrt(x * x + y * y + z * z + w * w)
+        if norm < 1.0e-12:
+            return np.eye(3)
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ]
+        )
+
     @staticmethod
     def _shape_local_z_min(
         shape_type: int,
@@ -256,26 +542,43 @@ class NewtonKinematics:
         """Lowest body-frame z coordinate reachable by a shape's surface.
 
         Handles the geometry primitives we encounter in practice (mesh,
-        sphere, box, capsule, cylinder, plane). Returns ``None`` for
-        unsupported types so the caller can fall back or skip.
+        sphere, box, capsule, cylinder). Returns ``None`` for unsupported
+        types so the caller can fall back or skip.
+
+        The shape's own rotation is applied: primitives are commonly attached
+        rotated (foot soles are often cylinders laid flat along the body x
+        axis), and treating their local axis as body-frame z overstates how far
+        they reach below the body origin by roughly their half-length.
         """
-        pos_z = float(shape_transform[2])
+        xform = np.asarray(shape_transform, dtype=float).reshape(-1)
+        pos_z = float(xform[2])
+        # Body-frame straight-down direction, expressed in the shape's local
+        # frame. Support distance along it is how far the shape reaches below
+        # its own origin.
+        rotation = NewtonKinematics._rotation_matrix(xform[3:7])
+        down = -rotation[2, :]
+
         if shape_type == int(GeoType.MESH) or shape_type == int(GeoType.CONVEX_MESH):
             if shape_source is None or not hasattr(shape_source, "vertices"):
                 return None
-            verts = np.asarray(shape_source.vertices).reshape(-1, 3)
+            verts = np.asarray(shape_source.vertices, dtype=float).reshape(-1, 3)
             if verts.size == 0:
                 return None
-            scale_z = float(shape_scale[2])
-            return pos_z + float(verts[:, 2].min()) * scale_z
+            scaled = verts * np.asarray(shape_scale, dtype=float).reshape(-1)[:3]
+            return pos_z + float((scaled @ rotation[2, :]).min())
         if shape_type == int(GeoType.SPHERE):
             return pos_z - float(shape_scale[0])
         if shape_type == int(GeoType.BOX):
-            return pos_z - 0.5 * float(shape_scale[2])
+            half_extents = 0.5 * np.asarray(shape_scale, dtype=float).reshape(-1)[:3]
+            return pos_z - float(np.abs(down) @ half_extents)
         if shape_type == int(GeoType.CAPSULE):
-            return pos_z - float(shape_scale[1]) - float(shape_scale[0])
+            radius, half_height = float(shape_scale[0]), float(shape_scale[1])
+            return pos_z - (half_height * abs(down[2]) + radius)
         if shape_type == int(GeoType.CYLINDER):
-            return pos_z - float(shape_scale[1])
+            radius, half_height = float(shape_scale[0]), float(shape_scale[1])
+            # Flat end caps: the rim contributes the radius scaled by how much
+            # the cylinder's axis is tilted away from the query direction.
+            return pos_z - (half_height * abs(down[2]) + radius * math.hypot(down[0], down[1]))
         return None
 
     def create_ik_solver(

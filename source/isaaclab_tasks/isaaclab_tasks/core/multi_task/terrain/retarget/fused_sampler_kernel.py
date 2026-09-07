@@ -31,10 +31,12 @@ dance. The only allocations are the K-sized output tensors that the
 downstream FPS + IK stages consume, and they're the smallest dtypes
 that fit each value.
 
-**Scope**: nc=4 (quadruped) only. The LSA hull check assumes a
-4-point polygon and uses an unrolled 4-element sorting network.
-Other foot counts raise :class:`NotImplementedError` from the
-launcher and the caller falls back to the chunked path.
+**Scope**: two and four feet, each with its own kernel. They share the
+sampling, template projection, patch query, and per-rank precompute, and
+differ only in the stance validity test -- four feet must form a convex
+quad in the template's winding order, whereas two need only keep their
+left-right ordering, having no area to be convex about. Other foot counts
+raise :class:`NotImplementedError` from the launcher.
 """
 
 from __future__ import annotations
@@ -294,6 +296,53 @@ def _foot_ranks(
     return out
 
 
+@wp.func
+def _yaw_admits(bits: wp.int32, yaw: wp.float32, num_yaw: int) -> int:
+    """1 if the patch's footprint fits a heading of ``yaw``, else 0.
+
+    The flatness search records one bit per tested heading over a half turn,
+    a rectangle being symmetric under 180 degrees. A heading is accepted when
+    the nearest tested bin is set, so a foot is only matched to a patch its
+    sole actually fits on.
+    """
+    if bits == -1:
+        return 1
+    span = wp.pi / float(num_yaw)
+    folded = wp.mod(yaw, wp.pi)
+    if folded < 0.0:
+        folded = folded + wp.pi
+    bin_index = int(wp.round(folded / span)) % num_yaw
+    if (bits >> bin_index) & 1 == 1:
+        return 1
+    return 0
+
+
+@wp.func
+def _yaw_admits_all4(
+    bits: wp.array(dtype=wp.int32),
+    e0: wp.int32,
+    c0: wp.int32,
+    e1: wp.int32,
+    c1: wp.int32,
+    e2: wp.int32,
+    c2: wp.int32,
+    e3: wp.int32,
+    c3: wp.int32,
+    yaw: wp.float32,
+    num_yaw: int,
+) -> int:
+    """1 when every contact foot's patch admits the stance heading."""
+    if c0 == 1 and _yaw_admits(bits[e0], yaw, num_yaw) == 0:
+        return 0
+    if c1 == 1 and _yaw_admits(bits[e1], yaw, num_yaw) == 0:
+        return 0
+    if c2 == 1 and _yaw_admits(bits[e2], yaw, num_yaw) == 0:
+        return 0
+    if c3 == 1 and _yaw_admits(bits[e3], yaw, num_yaw) == 0:
+        return 0
+    return 1
+
+
 # ----------------------------------------------------------------- kernel
 
 
@@ -314,6 +363,9 @@ def _fused_sampler_kernel(
     patch_pts: wp.array(dtype=wp.vec3),  # [N_p] real xyz
     patch_pts_z0: wp.array(dtype=wp.vec3),  # [N_p] same xyz with z=0 (hashgrid points)
     patch_grid_id: wp.uint64,  # built over patch_pts_z0
+    patch_quats: wp.array(dtype=wp.quat),
+    patch_admissible: wp.array(dtype=wp.int32),
+    num_yaw_bins: int,
     fk_shape_samples: wp.array2d(dtype=wp.vec3),  # [n_tpl, NC] canonical foot xyz
     cos_n: wp.vec4,  # per-foot cos(nominal angle)
     sin_n: wp.vec4,  # per-foot sin(nominal angle)
@@ -323,6 +375,7 @@ def _fused_sampler_kernel(
     tpl_idx_out: wp.array(dtype=wp.int32),  # [K]
     is_contact_out: wp.array2d(dtype=wp.uint8),  # [K, NC]
     contact_ik_out: wp.array2d(dtype=wp.vec3),  # [K, NC]
+    contact_rot_out: wp.array2d(dtype=wp.quat),  # [K, NC]
     n_found_out: wp.array(dtype=wp.uint8),  # [K]
     no_convex_out: wp.array(dtype=wp.uint8),  # [K]
 ):
@@ -462,6 +515,24 @@ def _fused_sampler_kernel(
         if _has_dup4(e0, e1, e2, e3) == 1:
             continue
 
+        # Orientation: skip patches whose footprint does not fit this stance's
+        # heading. Discs set every bit, so a point-footed robot is unaffected.
+        admits = _yaw_admits_all4(
+            patch_admissible,
+            e0,
+            contact0,
+            e1,
+            contact1,
+            e2,
+            contact2,
+            e3,
+            contact3,
+            yaw,
+            num_yaw_bins,
+        )
+        if admits == 0:
+            continue
+
         # Cost: precomputed per-(foot, rank) sum.
         cost = fr0.cost[r0] + fr1.cost[r1] + fr2.cost[r2] + fr3.cost[r3]
         if cost >= best_cost:
@@ -543,6 +614,10 @@ def _fused_sampler_kernel(
         contact_ik_out[k, 1] = wp.vec3(0.0, 0.0, 0.0)
         contact_ik_out[k, 2] = wp.vec3(0.0, 0.0, 0.0)
         contact_ik_out[k, 3] = wp.vec3(0.0, 0.0, 0.0)
+        contact_rot_out[k, 0] = wp.quat_identity()
+        contact_rot_out[k, 1] = wp.quat_identity()
+        contact_rot_out[k, 2] = wp.quat_identity()
+        contact_rot_out[k, 3] = wp.quat_identity()
         return
 
     no_convex_out[k] = wp.uint8(0)
@@ -558,43 +633,262 @@ def _fused_sampler_kernel(
     # Foot 0
     rb = combo[best_c, 0]
     if fr0.contact[rb] == 1:
-        pp = patch_pts[top0.idx[rb]]
+        pi = top0.idx[rb]
+        pp = patch_pts[pi]
         contact_ik_out[k, 0] = wp.vec3(pp[0], pp[1], pp[2] + foot_ground_offset)
+        contact_rot_out[k, 0] = patch_quats[pi]
         is_contact_out[k, 0] = wp.uint8(1)
         n_count += 1
     else:
         contact_ik_out[k, 0] = wp.vec3(wx0, wy0, wp.max(wz0, af0))
+        contact_rot_out[k, 0] = wp.quat_identity()
         is_contact_out[k, 0] = wp.uint8(0)
     # Foot 1
     rb = combo[best_c, 1]
     if fr1.contact[rb] == 1:
-        pp = patch_pts[top1.idx[rb]]
+        pi = top1.idx[rb]
+        pp = patch_pts[pi]
         contact_ik_out[k, 1] = wp.vec3(pp[0], pp[1], pp[2] + foot_ground_offset)
+        contact_rot_out[k, 1] = patch_quats[pi]
         is_contact_out[k, 1] = wp.uint8(1)
         n_count += 1
     else:
         contact_ik_out[k, 1] = wp.vec3(wx1, wy1, wp.max(wz1, af1))
+        contact_rot_out[k, 1] = wp.quat_identity()
         is_contact_out[k, 1] = wp.uint8(0)
     # Foot 2
     rb = combo[best_c, 2]
     if fr2.contact[rb] == 1:
-        pp = patch_pts[top2.idx[rb]]
+        pi = top2.idx[rb]
+        pp = patch_pts[pi]
         contact_ik_out[k, 2] = wp.vec3(pp[0], pp[1], pp[2] + foot_ground_offset)
+        contact_rot_out[k, 2] = patch_quats[pi]
         is_contact_out[k, 2] = wp.uint8(1)
         n_count += 1
     else:
         contact_ik_out[k, 2] = wp.vec3(wx2, wy2, wp.max(wz2, af2))
+        contact_rot_out[k, 2] = wp.quat_identity()
         is_contact_out[k, 2] = wp.uint8(0)
     # Foot 3
     rb = combo[best_c, 3]
     if fr3.contact[rb] == 1:
-        pp = patch_pts[top3.idx[rb]]
+        pi = top3.idx[rb]
+        pp = patch_pts[pi]
         contact_ik_out[k, 3] = wp.vec3(pp[0], pp[1], pp[2] + foot_ground_offset)
+        contact_rot_out[k, 3] = patch_quats[pi]
         is_contact_out[k, 3] = wp.uint8(1)
         n_count += 1
     else:
         contact_ik_out[k, 3] = wp.vec3(wx3, wy3, wp.max(wz3, af3))
+        contact_rot_out[k, 3] = wp.quat_identity()
         is_contact_out[k, 3] = wp.uint8(0)
+
+    n_found_out[k] = wp.uint8(n_count)
+
+
+@wp.kernel
+def _fused_sampler_kernel_nc2(
+    # ---- scalars / RNG ----
+    seed: int,
+    K: int,
+    n_pts: int,
+    n_tpl: int,
+    radius: wp.float32,
+    effective_radius: wp.float32,
+    query_radius: wp.float32,
+    outward_pen: wp.float32,
+    force_all_snap: int,
+    foot_ground_offset: wp.float32,
+    n_combos: int,
+    # ---- precomputed tables ----
+    patch_pts: wp.array(dtype=wp.vec3),
+    patch_pts_z0: wp.array(dtype=wp.vec3),
+    patch_grid_id: wp.uint64,
+    patch_quats: wp.array(dtype=wp.quat),
+    patch_admissible: wp.array(dtype=wp.int32),
+    num_yaw_bins: int,
+    fk_shape_samples: wp.array2d(dtype=wp.vec3),
+    cos_n: wp.vec2,
+    sin_n: wp.vec2,
+    combo: wp.array2d(dtype=wp.int32),
+    # ---- outputs (allocated by the launcher) ----
+    yaws_out: wp.array(dtype=wp.float32),
+    tpl_idx_out: wp.array(dtype=wp.int32),
+    is_contact_out: wp.array2d(dtype=wp.uint8),
+    contact_ik_out: wp.array2d(dtype=wp.vec3),
+    contact_rot_out: wp.array2d(dtype=wp.quat),
+    n_found_out: wp.array(dtype=wp.uint8),
+    no_convex_out: wp.array(dtype=wp.uint8),
+):
+    """Two-foot counterpart of :func:`_fused_sampler_kernel`.
+
+    Same pipeline -- sample a placement, project the template, query patches,
+    score assignments -- with the stance validity test changed to suit a pair
+    of feet. Two contacts enclose no area, so the four-point convex-hull and
+    winding checks have nothing to measure; what they exist to prevent is a
+    stance whose legs cross the body, and for a pair that is exactly the feet
+    swapping sides. The check below is therefore that the placed stance axis
+    still points the same way as the template's.
+
+    ``no_convex_out`` keeps the name it has in the quadruped kernel; here it
+    flags a slot where no assignment satisfied the contact, distinctness, and
+    side-ordering rules.
+    """
+    k = wp.tid()
+    if k >= K:
+        return
+
+    # ----- 1. Per-thread RNG -----
+    state = wp.rand_init(seed, k)
+    center_idx = wp.randi(state, 0, n_pts)
+    yaw = wp.randf(state) * TWO_PI
+    tpl_idx_val = wp.randi(state, 0, n_tpl)
+    yaws_out[k] = yaw
+    tpl_idx_out[k] = tpl_idx_val
+
+    center = patch_pts[center_idx]
+    cos_y = wp.cos(yaw)
+    sin_y = wp.sin(yaw)
+
+    # ----- 2. Un-canonicalize template into world-frame foot positions -----
+    tc0 = fk_shape_samples[tpl_idx_val, 0]
+    tc1 = fk_shape_samples[tpl_idx_val, 1]
+
+    mx0 = cos_n[0] * tc0[0] - sin_n[0] * tc0[1]
+    my0 = sin_n[0] * tc0[0] + cos_n[0] * tc0[1]
+    mx1 = cos_n[1] * tc1[0] - sin_n[1] * tc1[1]
+    my1 = sin_n[1] * tc1[0] + cos_n[1] * tc1[1]
+
+    wx0 = cos_y * mx0 - sin_y * my0 + center[0]
+    wy0 = sin_y * mx0 + cos_y * my0 + center[1]
+    wz0 = tc0[2] + center[2]
+    wx1 = cos_y * mx1 - sin_y * my1 + center[0]
+    wy1 = sin_y * mx1 + cos_y * my1 + center[1]
+    wz1 = tc1[2] + center[2]
+
+    tcx = (wx0 + wx1) * 0.5
+    tcy = (wy0 + wy1) * 0.5
+    tpl_r0 = wp.sqrt((wx0 - tcx) * (wx0 - tcx) + (wy0 - tcy) * (wy0 - tcy))
+    tpl_r1 = wp.sqrt((wx1 - tcx) * (wx1 - tcx) + (wy1 - tcy) * (wy1 - tcy))
+
+    # Template stance axis, foot 0 -> foot 1. Comparing against this by dot
+    # product avoids the wrap-around that an angle comparison hits when the
+    # stance happens to straddle +/-pi.
+    tpl_ax = wx1 - wx0
+    tpl_ay = wy1 - wy0
+
+    # ----- 3. Top-k hashgrid query per foot -----
+    top0 = _topk4_query(patch_grid_id, patch_pts_z0, wx0, wy0, query_radius)
+    top1 = _topk4_query(patch_grid_id, patch_pts_z0, wx1, wy1, query_radius)
+
+    # ----- 4. Per-(foot, rank) precompute -----
+    fr0 = _foot_ranks(top0, wx0, wy0, tcx, tcy, tpl_r0, patch_pts_z0, radius, effective_radius, outward_pen)
+    fr1 = _foot_ranks(top1, wx1, wy1, tcx, tcy, tpl_r1, patch_pts_z0, radius, effective_radius, outward_pen)
+
+    has_opt0 = int(0)
+    if top0.dist[0] < radius:
+        has_opt0 = 1
+    has_opt1 = int(0)
+    if top1.dist[0] < radius:
+        has_opt1 = 1
+
+    # ----- 5. Assignment loop -----
+    best_cost = float(1.0e30)
+    best_c = int(-1)
+
+    for c in range(n_combos):
+        r0 = combo[c, 0]
+        r1 = combo[c, 1]
+
+        contact0 = fr0.contact[r0]
+        contact1 = fr1.contact[r1]
+
+        if force_all_snap == 0:
+            if has_opt0 == 1 and contact0 == 0:
+                continue
+            if has_opt1 == 1 and contact1 == 0:
+                continue
+
+        # Distinctness: contact feet must pick distinct patches; air feet use
+        # a per-foot negative sentinel so they never collide.
+        e0 = -1
+        if contact0 == 1:
+            e0 = top0.idx[r0]
+        e1 = -2
+        if contact1 == 1:
+            e1 = top1.idx[r1]
+        if e0 == e1:
+            continue
+
+        # Orientation: a patch found flat only along certain headings cannot
+        # take a sole pointing elsewhere. The stance yaw sets each foot's
+        # heading, so reject the pairing rather than tilt the foot off the
+        # surface later.
+        if contact0 == 1:
+            if _yaw_admits(patch_admissible[e0], yaw, num_yaw_bins) == 0:
+                continue
+        if contact1 == 1:
+            if _yaw_admits(patch_admissible[e1], yaw, num_yaw_bins) == 0:
+                continue
+
+        cost = fr0.cost[r0] + fr1.cost[r1]
+        if cost >= best_cost:
+            continue
+
+        # Side ordering: the placed stance axis must not have flipped, which
+        # would put the left foot where the right belongs.
+        ax = fr1.target_x[r1] - fr0.target_x[r0]
+        ay = fr1.target_y[r1] - fr0.target_y[r0]
+        if ax * tpl_ax + ay * tpl_ay <= 0.0:
+            continue
+
+        best_cost = cost
+        best_c = c
+
+    # ----- 6. Emit outputs from best_c -----
+    if best_c < 0:
+        no_convex_out[k] = wp.uint8(1)
+        n_found_out[k] = wp.uint8(0)
+        is_contact_out[k, 0] = wp.uint8(0)
+        is_contact_out[k, 1] = wp.uint8(0)
+        contact_ik_out[k, 0] = wp.vec3(0.0, 0.0, 0.0)
+        contact_ik_out[k, 1] = wp.vec3(0.0, 0.0, 0.0)
+        contact_rot_out[k, 0] = wp.quat_identity()
+        contact_rot_out[k, 1] = wp.quat_identity()
+        return
+
+    no_convex_out[k] = wp.uint8(0)
+
+    af0 = patch_pts[top0.idx[0]][2] + foot_ground_offset
+    af1 = patch_pts[top1.idx[0]][2] + foot_ground_offset
+
+    n_count = int(0)
+
+    rb = combo[best_c, 0]
+    if fr0.contact[rb] == 1:
+        pi = top0.idx[rb]
+        pp = patch_pts[pi]
+        contact_ik_out[k, 0] = wp.vec3(pp[0], pp[1], pp[2] + foot_ground_offset)
+        contact_rot_out[k, 0] = patch_quats[pi]
+        is_contact_out[k, 0] = wp.uint8(1)
+        n_count += 1
+    else:
+        contact_ik_out[k, 0] = wp.vec3(wx0, wy0, wp.max(wz0, af0))
+        contact_rot_out[k, 0] = wp.quat_identity()
+        is_contact_out[k, 0] = wp.uint8(0)
+
+    rb = combo[best_c, 1]
+    if fr1.contact[rb] == 1:
+        pi = top1.idx[rb]
+        pp = patch_pts[pi]
+        contact_ik_out[k, 1] = wp.vec3(pp[0], pp[1], pp[2] + foot_ground_offset)
+        contact_rot_out[k, 1] = patch_quats[pi]
+        is_contact_out[k, 1] = wp.uint8(1)
+        n_count += 1
+    else:
+        contact_ik_out[k, 1] = wp.vec3(wx1, wy1, wp.max(wz1, af1))
+        contact_rot_out[k, 1] = wp.quat_identity()
+        is_contact_out[k, 1] = wp.uint8(0)
 
     n_found_out[k] = wp.uint8(n_count)
 
@@ -607,6 +901,9 @@ def run_fused_sampler(
     seed: int,
     K: int,
     patch_pts: torch.Tensor,  # [N, 3] float -- real xyz
+    patch_quats: torch.Tensor,  # [N, 4] float xyzw -- surface pose at each patch
+    patch_admissible: torch.Tensor,  # [N] int32 -- bitmask of headings the footprint fits
+    num_yaw_bins: int,
     fk_shape_samples: torch.Tensor,  # [n_tpl, NC, 3] float
     nominal_angles: torch.Tensor,  # [NC] float
     radius: float,
@@ -622,14 +919,12 @@ def run_fused_sampler(
     value), builds the morph-patch hashgrid, and runs the fused kernel
     once over ``K`` candidate slots. Returns a dict of K-sized outputs.
 
-    Restrictions: ``nc=4`` (quadruped); CUDA tensors required.
+    Dispatches on foot count: four feet run the quadruped kernel, two run
+    :func:`_fused_sampler_kernel_nc2`. CUDA tensors required.
     """
     nc = int(fk_shape_samples.shape[1])
-    if nc != 4:
-        raise NotImplementedError(
-            f"Fused sampler kernel supports only nc=4; got nc={nc}. "
-            "Use the chunked Python LSA path for other foot counts."
-        )
+    if nc not in (2, 4):
+        raise NotImplementedError(f"Fused sampler kernel supports nc=2 and nc=4; got nc={nc}.")
 
     device = patch_pts.device
     if not patch_pts.is_cuda:
@@ -639,17 +934,28 @@ def run_fused_sampler(
     patch_xy = patch_pts[:, :2].contiguous()
     patch_grid = build_spatial_grid_xy(patch_xy, radius=query_radius)
 
-    # 24 permutations at nc=4 (the all-distinct subset; non-distinct
-    # combos all get rejected by the kernel's distinctness check).
     import itertools
 
-    combo = torch.tensor(list(itertools.permutations(range(nc))), device=device, dtype=torch.int32)
+    if nc == 4:
+        # 24 permutations (the all-distinct subset; non-distinct combos all
+        # get rejected by the kernel's distinctness check).
+        combo = torch.tensor(list(itertools.permutations(range(nc))), device=device, dtype=torch.int32)
+    else:
+        # With only two feet, permutations of the rank slots would leave just
+        # two assignments to choose from. Every rank pair is cheap enough to
+        # score outright, which gives the matching real freedom -- the
+        # distinctness check still rules out both feet taking one patch.
+        combo = torch.tensor(list(itertools.product(range(4), repeat=nc)), device=device, dtype=torch.int32)
 
-    # Per-foot nominal-angle constants packed into wp.vec4.
+    # Per-foot nominal-angle constants packed into a warp vector.
     cos_n_t = torch.cos(nominal_angles).to(torch.float32).cpu().tolist()
     sin_n_t = torch.sin(nominal_angles).to(torch.float32).cpu().tolist()
-    cos_n_v = wp.vec4(cos_n_t[0], cos_n_t[1], cos_n_t[2], cos_n_t[3])
-    sin_n_v = wp.vec4(sin_n_t[0], sin_n_t[1], sin_n_t[2], sin_n_t[3])
+    if nc == 4:
+        cos_n_v = wp.vec4(cos_n_t[0], cos_n_t[1], cos_n_t[2], cos_n_t[3])
+        sin_n_v = wp.vec4(sin_n_t[0], sin_n_t[1], sin_n_t[2], sin_n_t[3])
+    else:
+        cos_n_v = wp.vec2(cos_n_t[0], cos_n_t[1])
+        sin_n_v = wp.vec2(sin_n_t[0], sin_n_t[1])
 
     # K-sized outputs in their tightest dtypes:
     # * yaws: float32 (precision matters for the IK seed).
@@ -662,27 +968,39 @@ def run_fused_sampler(
     tpl_idx = torch.empty((K,), dtype=torch.int32, device=device)
     is_contact = torch.empty((K, nc), dtype=torch.uint8, device=device)
     contact_ik = torch.empty((K, nc, 3), dtype=torch.float32, device=device)
+    contact_rot = torch.empty((K, nc, 4), dtype=torch.float32, device=device)
     n_found = torch.empty((K,), dtype=torch.uint8, device=device)
     no_convex = torch.empty((K,), dtype=torch.uint8, device=device)
 
+    scalar_inputs = [
+        int(seed),
+        int(K),
+        int(patch_pts.shape[0]),
+        int(fk_shape_samples.shape[0]),
+        float(radius),
+        float(query_radius if force_all_snap else radius),
+        float(query_radius),
+        float(outward_pen),
+        int(1 if force_all_snap else 0),
+        float(foot_ground_offset),
+    ]
+    # The two-foot kernel scores every rank pair, so its combo count varies
+    # with the table rather than being a compile-time constant.
+    if nc == 2:
+        scalar_inputs.append(int(combo.shape[0]))
+
     wp.launch(
-        _fused_sampler_kernel,
+        _fused_sampler_kernel if nc == 4 else _fused_sampler_kernel_nc2,
         dim=K,
         block_dim=int(block_dim),
         inputs=[
-            int(seed),
-            int(K),
-            int(patch_pts.shape[0]),
-            int(fk_shape_samples.shape[0]),
-            float(radius),
-            float(query_radius if force_all_snap else radius),
-            float(query_radius),
-            float(outward_pen),
-            int(1 if force_all_snap else 0),
-            float(foot_ground_offset),
+            *scalar_inputs,
             wp.from_torch(patch_pts.contiguous(), dtype=wp.vec3),
             patch_grid._pts_wp,  # the z=0 grid points (shared with the grid)
             patch_grid.grid.id,
+            wp.from_torch(patch_quats.contiguous(), dtype=wp.quat),
+            wp.from_torch(patch_admissible.contiguous(), dtype=wp.int32),
+            int(num_yaw_bins),
             wp.from_torch(fk_shape_samples.contiguous(), dtype=wp.vec3),
             cos_n_v,
             sin_n_v,
@@ -693,6 +1011,7 @@ def run_fused_sampler(
             wp.from_torch(tpl_idx, dtype=wp.int32),
             wp.from_torch(is_contact, dtype=wp.uint8),
             wp.from_torch(contact_ik, dtype=wp.vec3),
+            wp.from_torch(contact_rot, dtype=wp.quat),
             wp.from_torch(n_found, dtype=wp.uint8),
             wp.from_torch(no_convex, dtype=wp.uint8),
         ],
@@ -706,6 +1025,7 @@ def run_fused_sampler(
         "tpl_idx": tpl_idx.to(torch.int64),
         "is_contact_full": is_contact.bool(),
         "contact_ik": contact_ik,
+        "contact_rot": contact_rot,
         "n_found": n_found.to(torch.int64),
         "no_convex": no_convex.bool(),
     }

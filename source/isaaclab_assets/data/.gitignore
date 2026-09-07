@@ -1,0 +1,3 @@
+# Robot descriptions fetched on demand (see scripts/fetch_robot_descriptions.py).
+# They are large binary mesh bundles, so they are downloaded rather than tracked.
+unitree_description/

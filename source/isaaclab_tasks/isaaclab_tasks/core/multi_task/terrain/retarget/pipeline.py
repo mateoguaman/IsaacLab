@@ -35,6 +35,7 @@ __all__ = [
     "SamplerOutput",
     "SamplerSizing",
     "compute_sampler_sizing",
+    "resolve_description_path",
     "resolve_foot_body_names",
 ]
 
@@ -147,6 +148,32 @@ def resolve_foot_body_names(foot_body_names: Sequence[str] | str, body_names: Se
     return list(foot_body_names)
 
 
+def resolve_description_path(spawn_cfg) -> str:
+    """Return the robot description file a spawn config points at.
+
+    :class:`~isaaclab.sim.UsdFileCfg` names the field ``usd_path`` while
+    :class:`~isaaclab.sim.UrdfFileCfg` names it ``asset_path``. Both are
+    accepted by :class:`~isaaclab_tasks.core.multi_task.kinematics.NewtonKinematics`,
+    so callers only need the path.
+
+    Args:
+        spawn_cfg: Spawn configuration of the robot articulation.
+
+    Returns:
+        Path or URL of the description file.
+
+    Raises:
+        TypeError: If the spawn config exposes neither field.
+    """
+    for field in ("usd_path", "asset_path"):
+        path = getattr(spawn_cfg, field, None)
+        if path:
+            return str(path)
+    raise TypeError(
+        f"{type(spawn_cfg).__name__} exposes no 'usd_path' or 'asset_path'; cannot locate the robot description."
+    )
+
+
 class RetargetPipeline:
     """Orchestrates the staged retargeting pipeline.
 
@@ -168,10 +195,10 @@ class RetargetPipeline:
             from isaaclab.utils.assets import check_file_path, retrieve_file_path
 
             articulation_cfg = env.scene[cfg.asset_cfg.name].cfg
-            usd_path = articulation_cfg.spawn.usd_path
+            usd_path = resolve_description_path(articulation_cfg.spawn)
             status = check_file_path(usd_path)
             if status == 0:
-                raise FileNotFoundError(f"USD not found: {usd_path}")
+                raise FileNotFoundError(f"Robot description not found: {usd_path}")
             if status == 2:
                 usd_path = retrieve_file_path(usd_path, force_download=False)
 
@@ -201,6 +228,7 @@ class RetargetPipeline:
         self._reject_val: dict[str, int] = {}
         self._ik_iterations_used: int = 0
         self._solver_costs: torch.Tensor | None = None
+        self._n_diverged: int = 0
         self._n_ik_problems: int = 0
         """IK problem count from the last run — one problem per accepted
         polygon."""
@@ -286,7 +314,7 @@ class RetargetPipeline:
         self,
         N: int,
         wp_mesh: wp.Mesh,
-    ) -> tuple[list, list[ik.IKObjectivePosition], ik.IKObjectivePosition, ik.IKObjectiveRotation]:
+    ) -> tuple[list, list[ik.IKObjectivePosition], list, ik.IKObjectivePosition, ik.IKObjectiveRotation]:
         """Build standard + extra IK objectives for ``N`` problems."""
         device = self.kin.device
 
@@ -295,7 +323,7 @@ class RetargetPipeline:
                 link_index=fid,
                 link_offset=wp.vec3(0, 0, 0),
                 target_positions=wp.zeros(N, dtype=wp.vec3, device=device),
-                weight=1.0,
+                weight=self.cfg.foot_contact_weight,
             )
             for fid in self.foot_body_ids
         ]
@@ -317,12 +345,26 @@ class RetargetPipeline:
             weight=10.0,
         )
 
-        all_objs = [*contact_objs, base_pos_obj, base_rot_obj, jl_obj]
+        # Sole orientation. Only worth building when a sole has enough extent
+        # for its tilt to matter; a point foot leaves this at zero weight.
+        contact_rot_objs: list = []
+        if self.cfg.foot_rotation_weight > 0.0:
+            contact_rot_objs = [
+                ik.IKObjectiveRotation(
+                    link_index=fid,
+                    link_offset_rotation=wp.quat_identity(),
+                    target_rotations=wp.zeros(N, dtype=wp.vec4, device=device),
+                    weight=self.cfg.foot_rotation_weight,
+                )
+                for fid in self.foot_body_ids
+            ]
+
+        all_objs = [*contact_objs, *contact_rot_objs, base_pos_obj, base_rot_obj, jl_obj]
 
         for obj_cfg in self.cfg.extra_objectives:
             all_objs.append(obj_cfg.class_type(obj_cfg, self, wp_mesh))
 
-        return all_objs, contact_objs, base_pos_obj, base_rot_obj
+        return all_objs, contact_objs, contact_rot_objs, base_pos_obj, base_rot_obj
 
     def _build_criteria(self, wp_mesh: wp.Mesh) -> dict[str, CriterionFn]:
         """Build the acceptance-criteria dict from ``cfg.criteria``.
@@ -412,7 +454,9 @@ class RetargetPipeline:
             chunk_size = self._compute_ik_chunk_size(N, sniff_objs)
             del sniff_objs
 
-            all_objs, contact_objs, base_pos_obj, base_rot_obj = self._build_objectives(chunk_size, wp_mesh)
+            all_objs, contact_objs, contact_rot_objs, base_pos_obj, base_rot_obj = self._build_objectives(
+                chunk_size, wp_mesh
+            )
             has_autodiff = any(not obj.supports_analytic() for obj in all_objs)
             jac_mode = ik.IKJacobianType.MIXED if has_autodiff else ik.IKJacobianType.ANALYTIC
             solver = self.kin.create_ik_solver(all_objs, chunk_size, jacobian_mode=jac_mode)
@@ -424,6 +468,7 @@ class RetargetPipeline:
             batch_size = max(1, min(3, max_iters))
             iters_used = 0
             all_costs_t = torch.empty(N, device=self.buffer.device, dtype=torch.float32)
+            total_diverged = 0
 
             is_cuda = self.kin.device.startswith("cuda")
             self._chunk_profile_meta = {
@@ -465,7 +510,9 @@ class RetargetPipeline:
                 if c_size < chunk_size:
                     rebuild_t0 = time.perf_counter()
                     del solver
-                    all_objs, contact_objs, base_pos_obj, base_rot_obj = self._build_objectives(c_size, wp_mesh)
+                    all_objs, contact_objs, contact_rot_objs, base_pos_obj, base_rot_obj = self._build_objectives(
+                        c_size, wp_mesh
+                    )
                     solver = self.kin.create_ik_solver(all_objs, c_size, jacobian_mode=jac_mode)
                     _sync_now()
                     profile["rebuild"] = True
@@ -474,6 +521,7 @@ class RetargetPipeline:
                 scatter_t0 = time.perf_counter()
                 if contact_objs:
                     self.buffer.scatter_contact_targets(contact_objs, c_size, src_offset=start)
+                self.buffer.scatter_contact_rotations(contact_rot_objs, c_size, src_offset=start)
                 wp.copy(
                     base_pos_obj.target_positions,
                     self.buffer.base_target_pos,
@@ -493,6 +541,7 @@ class RetargetPipeline:
 
                 prev_cost = float("inf")
                 chunk_iters = 0
+                n_diverged = 0
                 for _ in range(0, max_iters, batch_size):
                     iters = min(batch_size, max_iters - chunk_iters)
                     solve_t0 = time.perf_counter()
@@ -501,13 +550,29 @@ class RetargetPipeline:
                     profile["iter_solve_ms"].append((time.perf_counter() - solve_t0) * 1000.0)
                     chunk_iters += iters
                     rb_t0 = time.perf_counter()
-                    cur_cost = float(wp.to_torch(solver.costs)[:c_size].mean())
+                    # A single diverged problem must not decide the whole
+                    # chunk's stopping rule: averaging in its non-finite cost
+                    # makes every later comparison NaN, which never satisfies
+                    # the threshold and burns the full iteration budget on
+                    # problems that already converged. Reduce over the finite
+                    # ones and carry the diverged count instead; the
+                    # solver-cost criterion drops those rows afterwards.
+                    costs = wp.to_torch(solver.costs)[:c_size]
+                    finite = torch.isfinite(costs)
+                    n_diverged = int((~finite).sum())
                     profile["iter_cost_rb_ms"].append((time.perf_counter() - rb_t0) * 1000.0)
+                    if n_diverged == c_size:
+                        cur_cost = float("inf")
+                        profile["iter_costs"].append(cur_cost)
+                        break
+                    cur_cost = float(costs[finite].mean())
                     profile["iter_costs"].append(cur_cost)
                     if abs(prev_cost - cur_cost) < threshold:
                         break
                     prev_cost = cur_cost
                     jq_in = jq_out
+                profile["n_diverged"] = n_diverged
+                total_diverged += n_diverged
 
                 wb_t0 = time.perf_counter()
                 iters_used = max(iters_used, chunk_iters)
@@ -522,6 +587,13 @@ class RetargetPipeline:
                 self._chunk_profile.append(profile)
 
             self._solver_costs = all_costs_t
+            self._n_diverged = total_diverged
+            if total_diverged:
+                print(
+                    f"  IK diverged on {total_diverged} of {N} problems (non-finite cost);"
+                    " the solver-cost criterion drops them.",
+                    flush=True,
+                )
             total_iters = iters_used
 
         with self._time("fk_eval"):

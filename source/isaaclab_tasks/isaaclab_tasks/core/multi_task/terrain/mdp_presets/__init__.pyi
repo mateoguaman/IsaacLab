@@ -21,6 +21,12 @@ __all__ = [
     "HeightScannerPrimPathCfg",
     "RobotArticulationCfg",
     "RetargetLateralHipJointPatternCfg",
+    "RetargetMinContactsCfg",
+    "RetargetSnapDistanceCfg",
+    "RetargetFootRotationWeightCfg",
+    "RetargetFootContactWeightCfg",
+    "RetargetMorphPatchOversampleCfg",
+    "RetargetTerrainCollisionMarginCfg",
     "SyncFootPairsCfg",
 ]
 
@@ -37,6 +43,12 @@ from .robots import (
     FootBodyNamesCfg,
     HeightScannerPrimPathCfg,
     RetargetLateralHipJointPatternCfg,
+    RetargetMinContactsCfg,
+    RetargetSnapDistanceCfg,
+    RetargetFootRotationWeightCfg,
+    RetargetFootContactWeightCfg,
+    RetargetMorphPatchOversampleCfg,
+    RetargetTerrainCollisionMarginCfg,
     RobotArticulationCfg,
     SyncFootPairsCfg,
 )

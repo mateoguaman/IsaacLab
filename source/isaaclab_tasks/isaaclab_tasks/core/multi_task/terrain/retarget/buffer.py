@@ -27,6 +27,18 @@ def _scatter_contacts(
     dst[i] = src[(i % n_candidates) * n_contacts + i // n_candidates]
 
 
+@wp.kernel
+def _scatter_contact_rotations(
+    src: wp.array(dtype=wp.vec4),
+    dst: wp.array(dtype=wp.vec4),
+    n_candidates: int,
+    n_contacts: int,
+):
+    """Deinterleave rotations: src[cand*nc + foot] -> dst[foot*N + cand]."""
+    i = wp.tid()
+    dst[i] = src[(i % n_candidates) * n_contacts + i // n_candidates]
+
+
 class RetargetBuffer:
     """Pre-allocated GPU buffer shared across all pipeline stages.
 
@@ -69,6 +81,7 @@ class RetargetBuffer:
         sz_bq = n * nb * 7  # body_q
         sz_bp = n * 3  # base_target_pos
         sz_br = n * 4  # base_target_rot
+        sz_cr = n * nc * 4  # contact_target_rot
 
         # Cumulative offsets
         self._o_ct = 0
@@ -77,7 +90,8 @@ class RetargetBuffer:
         self._o_bq = sz_ct + sz_ji + sz_jr
         self._o_bp = sz_ct + sz_ji + sz_jr + sz_bq
         self._o_br = sz_ct + sz_ji + sz_jr + sz_bq + sz_bp
-        total = sz_ct + sz_ji + sz_jr + sz_bq + sz_bp + sz_br
+        self._o_cr = sz_ct + sz_ji + sz_jr + sz_bq + sz_bp + sz_br
+        total = sz_ct + sz_ji + sz_jr + sz_bq + sz_bp + sz_br + sz_cr
 
         torch_dev = torch.device(device)
         self._data = torch.zeros(total, dtype=torch.float32, device=torch_dev)
@@ -105,6 +119,18 @@ class RetargetBuffer:
         """``[max_candidates * num_contacts, 3]``."""
         s = self._o_ct
         return self._data[s : s + self.max_candidates * self.num_contacts * 3].view(-1, 3)
+
+    @property
+    def contact_target_rot_t(self) -> torch.Tensor:
+        """``[max_candidates * num_contacts, 4]`` xyzw target foot orientations.
+
+        The orientation the terrain demands of each foot: ``+z`` along the
+        surface normal under its contact target and ``+x`` along the heading
+        the patch admits. Slots the sampler marks as air keep the identity
+        rotation, which the rotation objective is not applied to.
+        """
+        s = self._o_cr
+        return self._data[s : s + self.max_candidates * self.num_contacts * 4].view(-1, 4)
 
     @property
     def is_contact_t(self) -> torch.Tensor:
@@ -159,6 +185,11 @@ class RetargetBuffer:
     def contact_targets(self) -> wp.array:
         """``[max_candidates * num_contacts]`` of ``vec3``."""
         return wp.from_torch(self.contact_targets_t, dtype=wp.vec3)
+
+    @property
+    def contact_target_rot(self) -> wp.array:
+        """``[max_candidates * num_contacts]`` of ``vec4`` (xyzw)."""
+        return wp.from_torch(self.contact_target_rot_t, dtype=wp.vec4)
 
     @property
     def joint_q_init(self) -> wp.array:
@@ -231,6 +262,38 @@ class RetargetBuffer:
         )
         for f_idx, obj in enumerate(objectives):
             wp.copy(obj.target_positions, flat_dst, src_offset=f_idx * n_active, count=n_active)
+
+    def scatter_contact_rotations(
+        self,
+        objectives: list,
+        n_active: int,
+        src_offset: int = 0,
+    ) -> None:
+        """Deinterleave contact target rotations into per-objective warp arrays.
+
+        Mirrors :meth:`scatter_contact_targets` for the orientation each foot
+        must adopt to lie on its patch.
+
+        Args:
+            objectives: IK rotation objectives (one per contact body).
+            n_active: Number of active candidates.
+            src_offset: Starting candidate index into the buffer's rotation slab.
+        """
+        if not objectives:
+            return
+        nc = self.num_contacts
+        src = self.contact_target_rot
+        if src_offset != 0:
+            src = src[src_offset * nc : (src_offset + n_active) * nc]
+        flat_dst = wp.zeros(nc * n_active, dtype=wp.vec4, device=self.device)
+        wp.launch(
+            _scatter_contact_rotations,
+            dim=nc * n_active,
+            inputs=[src, flat_dst, n_active, nc],
+            device=self.device,
+        )
+        for f_idx, obj in enumerate(objectives):
+            wp.copy(obj.target_rotations, flat_dst, src_offset=f_idx * n_active, count=n_active)
 
     def reset(self) -> None:
         """Zero masks and counters for a new pipeline run."""

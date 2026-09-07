@@ -96,21 +96,37 @@ class JointWithinLimitCfg(CriterionBaseCfg):
 class SupportPolygonStabilityCfg(CriterionBaseCfg):
     """Config for :class:`SupportPolygonStability`.
 
-    The lateral tolerance only applies when the number of contacts is
-    exactly two (support collapses to a segment). For ``nc >= 3`` the
-    criterion is parameter-free (strict hull inclusion).
+    The support region is the convex hull of the sole outlines of every foot
+    in contact, so the criterion applies unchanged at any contact count: four
+    point-like quadruped feet give a quadrilateral, two humanoid soles give a
+    broad region spanning both feet, and a single sole is a valid region in
+    its own right.
     """
 
     name: str = "stability"
     class_type: type | str = "{DIR}.criteria:SupportPolygonStability"
 
-    segment_tol_frac: float = 0.05
-    """``nc == 2`` lateral tolerance fraction [unitless].
+    margin: float = 0.0
+    """Distance the CoM must keep from the support boundary [m].
 
-    Effective tolerance is ``segment_tol_frac × segment_length``;
-    segment-length scaling is a finite-foot-footprint regularization of
-    the otherwise measure-zero segment-support balance condition. Unused
-    when ``nc != 2``.
+    ``0.0`` accepts any pose whose CoM projects inside the region. Positive
+    values demand clearance, rejecting poses that are balanced but marginal.
+    """
+
+    contact_height_tol: float = 0.001
+    """How far above its lowest point a foot sample still counts as sole [m].
+
+    Forwarded to
+    :meth:`~isaaclab_tasks.core.multi_task.kinematics.NewtonKinematics.foot_contact_hulls`.
+    Flat soles are insensitive to it; curved feet grow with it.
+    """
+
+    num_directions: int = 32
+    """Probe directions used for the support-function test [unitless].
+
+    The region is bounded by the sampled directions, so a low count admits
+    slightly more than the true hull: the overshoot is ``1 / cos(pi / n) - 1``
+    of the inradius, about 0.5% at the default and 2% at 16.
     """
 
 

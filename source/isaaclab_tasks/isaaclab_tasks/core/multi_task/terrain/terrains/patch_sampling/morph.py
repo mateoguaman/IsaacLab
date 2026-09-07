@@ -25,6 +25,14 @@ from ....utils.grid_downsample import grid_bucket_downsample
 from . import cfg as patch_cfg
 from .kernels import morph_validity_kernel, rasterize_grid_kernel
 
+MORPH_YAW_BINS = 8
+"""Headings tested per cell for a rectangular footprint, spanning a half turn.
+
+A rectangle is symmetric under 180 degrees, so ``[0, pi)`` covers every
+distinct orientation. Consumers matching a foot's heading against a patch must
+use the same count to read the admissibility bits.
+"""
+
 MORPH_TIMINGS: dict[str, float] = {}
 """Cumulative wall-time per sub-phase of :func:`find_flat_patches_morphological`.
 
@@ -155,6 +163,105 @@ def _yaw_to_quat_xyzw(yaw: torch.Tensor) -> torch.Tensor:
     return torch.stack([zeros, zeros, half.sin(), half.cos()], dim=-1)
 
 
+def _fit_surface_planes_at(
+    heightmap: torch.Tensor,
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Least-squares plane fit of the surface under ``mask`` at chosen cells.
+
+    A footprint resting on sloped or uneven ground must be tilted to match it,
+    so each cell needs the plane its footprint actually spans rather than the
+    single height sampled at its centre. Footprint masks are symmetric about
+    their centre, which zeroes the cross terms of the normal equations and
+    leaves each plane coefficient as a weighted sum over the window.
+
+    Evaluated only at the requested cells: a terrain heightmap runs to hundreds
+    of millions of cells, while the cells that become patches number in the
+    thousands.
+
+    Args:
+        heightmap: ``[H, W]`` surface heights [m]; non-finite entries are
+            treated as the window's own mean, which only arises at cells the
+            validity filter already rejects.
+        rows: ``[N]`` row indices of the cells to fit.
+        cols: ``[N]`` column indices of the cells to fit.
+        mask: ``[K, K]`` boolean footprint kernel.
+        scale: Grid spacing [m].
+
+    Returns:
+        Surface normals ``[N, 3]`` (unit, +z up) and the plane's fitted height
+        at each requested cell centre ``[N]`` [m].
+    """
+    device = heightmap.device
+    weight = mask.to(torch.float32)
+    k = weight.shape[0]
+    radius = (k - 1) // 2
+    offsets = (torch.arange(k, device=device, dtype=torch.float32) - radius) * scale
+    dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+
+    padded = torch.nn.functional.pad(heightmap.view(1, 1, *heightmap.shape), (radius,) * 4, mode="replicate")[0, 0]
+    span = torch.arange(k, device=device)
+    windows = padded[(rows.view(-1, 1, 1) + span.view(1, -1, 1)), (cols.view(-1, 1, 1) + span.view(1, 1, -1))]
+    windows = torch.nan_to_num(windows, nan=0.0, posinf=0.0, neginf=0.0)
+
+    count = weight.sum().clamp_min(1.0)
+    second_x = (weight * dx * dx).sum().clamp_min(1.0e-12)
+    second_y = (weight * dy * dy).sum().clamp_min(1.0e-12)
+    weighted = windows * weight
+    fitted_height = weighted.sum(dim=(-2, -1)) / count
+    slope_x = (weighted * dx).sum(dim=(-2, -1)) / second_x
+    slope_y = (weighted * dy).sum(dim=(-2, -1)) / second_y
+
+    normal = torch.stack([-slope_x, -slope_y, torch.ones_like(slope_x)], dim=-1)
+    return torch.nn.functional.normalize(normal, dim=-1), fitted_height
+
+
+def _surface_frame_to_quat_xyzw(normal: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    """Orientation whose +z follows ``normal`` and whose +x follows ``yaw``.
+
+    The requested heading is projected onto the surface plane, so the returned
+    frame both lies on the surface and points the footprint's long axis the way
+    the flatness search found it fits.
+
+    Args:
+        normal: ``[..., 3]`` unit surface normals.
+        yaw: ``[...]`` headings about world +z [rad].
+
+    Returns:
+        ``[..., 4]`` quaternions in ``(x, y, z, w)`` convention.
+    """
+    heading = torch.stack([yaw.cos(), yaw.sin(), torch.zeros_like(yaw)], dim=-1)
+    forward = heading - normal * (heading * normal).sum(dim=-1, keepdim=True)
+    # A heading parallel to the normal leaves nothing to project; any in-plane
+    # axis is then equally valid, so fall back to world +y crossed with it.
+    degenerate = forward.norm(dim=-1, keepdim=True) < 1.0e-6
+    fallback = torch.cross(normal, torch.tensor([0.0, 1.0, 0.0], device=normal.device).expand_as(normal), dim=-1)
+    forward = torch.where(degenerate, fallback, forward)
+    x_axis = torch.nn.functional.normalize(forward, dim=-1)
+    y_axis = torch.cross(normal, x_axis, dim=-1)
+
+    # Shepperd's method: build from whichever diagonal term is largest so the
+    # square root never divides by something near zero.
+    m = torch.stack([x_axis, y_axis, normal], dim=-2).transpose(-1, -2)
+    trace = m[..., 0, 0] + m[..., 1, 1] + m[..., 2, 2]
+    quat = torch.zeros((*normal.shape[:-1], 4), device=normal.device, dtype=normal.dtype)
+
+    w_big = trace > 0.0
+    s = torch.sqrt((trace + 1.0).clamp_min(1.0e-12)) * 2.0
+    quat[..., 3] = torch.where(w_big, 0.25 * s, quat[..., 3])
+    quat[..., 0] = torch.where(w_big, (m[..., 2, 1] - m[..., 1, 2]) / s, quat[..., 0])
+    quat[..., 1] = torch.where(w_big, (m[..., 0, 2] - m[..., 2, 0]) / s, quat[..., 1])
+    quat[..., 2] = torch.where(w_big, (m[..., 1, 0] - m[..., 0, 1]) / s, quat[..., 2])
+
+    # Surface normals stay within a hemisphere of +z here, so the trace is
+    # positive except for degenerate fits; identity is the right answer there.
+    quat[..., 3] = torch.where(w_big, quat[..., 3], torch.ones_like(quat[..., 3]))
+    return torch.nn.functional.normalize(quat, dim=-1)
+
+
 def _rasterize_mesh(
     wp_mesh: wp.Mesh, x_range: tuple[float, float], y_range: tuple[float, float], scale: float, device: torch.device
 ) -> tuple[torch.Tensor, float, float]:
@@ -197,28 +304,20 @@ def _rasterize_mesh(
 def _morphological_validity(
     heightmap: torch.Tensor, mask: torch.Tensor, max_height_diff: float, z_range: tuple[float, float]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute morphological validity and height-range maps via a Warp kernel.
-
-    For each cell, reduces max and min over the height values under the
-    boolean footprint ``mask`` and returns whether the reduction stays
-    within ``max_height_diff`` and ``z_range``.
+    """Max-min-over-footprint validity plus the height range it measured.
 
     Args:
         heightmap: ``[H, W]`` heightmap tensor (``inf`` for missed rays).
         mask: ``[K, K]`` boolean footprint kernel.
         max_height_diff: Maximum allowed height range within the footprint [m].
-        z_range: ``(z_min, z_max)`` world-space bounds for valid heights.
+        z_range: Allowed absolute height band [m].
 
     Returns:
-        ``(valid, h_range)`` — boolean validity mask ``[H, W]`` and the
-        per-cell footprint height range ``[H, W]`` (undefined on invalid
-        cells; callers must gate reads on ``valid``).
+        ``(valid, height_range)`` per cell.
     """
-    H, W = heightmap.shape
-    k = mask.shape[0]
-    pad = k // 2
     device = heightmap.device
-
+    H, W = heightmap.shape
+    pad = mask.shape[0] // 2
     hm_c = heightmap.contiguous()
     mask_u8 = mask.to(torch.uint8).contiguous()
 
@@ -257,9 +356,12 @@ def find_flat_patches_morphological(
     1. Rasterizes the mesh to a 2D heightmap with one batched ray-cast.
     2. Computes a validity mask via morphological max-min filtering using the
        configured robot footprint kernel.
-    3. For rectangular footprints, tests multiple yaw angles and records which
-       yaw produces the smallest height range at each cell.
-    4. Samples ``num_patches`` from the valid region, optionally with
+    3. For rectangular footprints, tests multiple yaw angles and records both
+       which yaw produces the smallest height range at each cell and the full
+       set of yaws that fit there.
+    4. Least-squares fits the surface plane under the footprint, so each patch
+       carries the orientation something resting on it must adopt.
+    5. Samples ``num_patches`` from the valid region, optionally with
        farthest-point refinement for spatial coverage.
 
     Args:
@@ -268,8 +370,12 @@ def find_flat_patches_morphological(
         cfg: Morphological sampling configuration.
 
     Returns:
-        Tensor of shape ``(num_patches, 7)`` — ``[x, y, z, qx, qy, qz, qw]``
-        in the mesh frame with origin subtracted (quaternion is absolute).
+        Tensor of shape ``(num_patches, 8)`` --
+        ``[x, y, z, qx, qy, qz, qw, admissible_yaw_bits]`` in the mesh frame
+        with origin subtracted. The quaternion is absolute: its ``+z`` is the
+        fitted surface normal and its ``+x`` the best-fitting heading. The last
+        column packs one bit per tested yaw (all bits set for a disc, which
+        fits every heading).
     """
     MORPH_TIMINGS.clear()
     device = wp.device_to_torch(wp_mesh.device)
@@ -310,16 +416,21 @@ def find_flat_patches_morphological(
     with _morph_time("validity", device):
         if is_rect:
             # test 8 discrete yaw angles in [0, pi) — rectangle has 180-deg symmetry
-            num_yaw = 8
+            num_yaw = MORPH_YAW_BINS
             yaw_angles = torch.linspace(0, math.pi, num_yaw + 1, device=device)[:num_yaw]
             rotated_masks = _build_rotated_rect_masks(footprint, scale, yaw_angles, device)
 
             best_range = torch.full((H, W), float("inf"), device=device)
             best_yaw_idx = torch.zeros((H, W), dtype=torch.long, device=device)
             combined_valid = torch.zeros((H, W), dtype=torch.bool, device=device)
+            # One bit per tested yaw: a rectangular footprint fits some
+            # headings and not others, and downstream matching needs the whole
+            # admissible set rather than only the single best heading.
+            admissible_yaw = torch.zeros((H, W), dtype=torch.int32, device=device)
 
             for yi, mask in enumerate(rotated_masks):
                 valid_yi, h_range = _morphological_validity(heightmap, mask, cfg.max_height_diff, z_range)
+                admissible_yaw |= valid_yi.to(torch.int32) << yi
                 improved = valid_yi & (h_range < best_range)
                 best_range[improved] = h_range[improved]
                 best_yaw_idx[improved] = yi
@@ -327,10 +438,15 @@ def find_flat_patches_morphological(
 
             valid = combined_valid
             yaw_map = yaw_angles[best_yaw_idx]
+            fit_masks = rotated_masks
         else:
             footprint_mask = _build_footprint_mask(footprint, scale, device)
             valid, _ = _morphological_validity(heightmap, footprint_mask, cfg.max_height_diff, z_range)
             yaw_map = torch.zeros((H, W), device=device)
+            # A disc fits every heading, so every tested yaw is admissible.
+            admissible_yaw = torch.full((H, W), -1, dtype=torch.int32, device=device)
+            best_yaw_idx = torch.zeros((H, W), dtype=torch.long, device=device)
+            fit_masks = [footprint_mask]
 
         valid_coords = valid.nonzero(as_tuple=False)  # [K, 2]
         num_valid = valid_coords.shape[0]
@@ -354,21 +470,43 @@ def find_flat_patches_morphological(
         perm = torch.randperm(num_valid, device=device)[:n_candidates]
         candidates_rc = valid_coords[perm]
 
-        cand_x = hm_x0 + (candidates_rc[:, 0].float() + 0.5) * scale
-        cand_y = hm_y0 + (candidates_rc[:, 1].float() + 0.5) * scale
-        cand_z = heightmap[candidates_rc[:, 0], candidates_rc[:, 1]]
-        cand_yaw = yaw_map[candidates_rc[:, 0], candidates_rc[:, 1]]
-        cand_quat = _yaw_to_quat_xyzw(cand_yaw)
-        cand_pos = torch.stack([cand_x, cand_y, cand_z], dim=-1)
+        rows, cols = candidates_rc[:, 0], candidates_rc[:, 1]
+        cand_x = hm_x0 + (rows.float() + 0.5) * scale
+        cand_y = hm_y0 + (cols.float() + 0.5) * scale
+        # The fitted plane's height at the cell centre, rather than the raw
+        # sample, is what a footprint spanning the cell actually rests on.
+        cand_yaw = yaw_map[rows, cols]
+        cand_yaw_idx = best_yaw_idx[rows, cols]
+        cand_admissible = admissible_yaw[rows, cols].to(torch.float32)
+        cand_xy = torch.stack([cand_x, cand_y], dim=-1)
 
     with _morph_time("fps", device):
         if cfg.oversample_ratio > 1.0 and n_candidates > cfg.num_patches:
-            sel_idx = grid_bucket_downsample(cand_pos[:, :2], cfg.num_patches)
-            pos = cand_pos[sel_idx]
-            quat = cand_quat[sel_idx]
+            sel_idx = grid_bucket_downsample(cand_xy, cfg.num_patches)
         else:
-            pos = cand_pos[: cfg.num_patches]
-            quat = cand_quat[: cfg.num_patches]
+            sel_idx = torch.arange(min(cfg.num_patches, n_candidates), device=device)
+        sel_rows, sel_cols = rows[sel_idx], cols[sel_idx]
+        sel_xy = cand_xy[sel_idx]
+        sel_yaw = cand_yaw[sel_idx]
+        sel_yaw_idx = cand_yaw_idx[sel_idx]
+        admissible = cand_admissible[sel_idx]
 
-        result = torch.cat([pos - origin_t, quat], dim=-1)
+    with _morph_time("plane_fit", device):
+        # Fit the surface under each kept patch using the footprint orientation
+        # that was found to fit there, so the pose reflects the ground the
+        # footprint actually spans.
+        fitted_z = torch.zeros(sel_rows.shape[0], device=device)
+        normal = torch.zeros((sel_rows.shape[0], 3), device=device)
+        normal[:, 2] = 1.0
+        for yi, mask in enumerate(fit_masks):
+            group = (sel_yaw_idx == yi).nonzero(as_tuple=False).squeeze(-1)
+            if group.numel() == 0:
+                continue
+            normal_g, fitted_g = _fit_surface_planes_at(heightmap, sel_rows[group], sel_cols[group], mask, scale)
+            normal[group] = normal_g
+            fitted_z[group] = fitted_g
+
+        quat = _surface_frame_to_quat_xyzw(normal, sel_yaw)
+        pos = torch.cat([sel_xy, fitted_z.unsqueeze(-1)], dim=-1)
+        result = torch.cat([pos - origin_t, quat, admissible.unsqueeze(-1)], dim=-1)
     return result

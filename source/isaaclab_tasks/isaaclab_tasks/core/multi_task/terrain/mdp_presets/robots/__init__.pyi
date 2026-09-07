@@ -11,7 +11,13 @@ __all__ = [
     "HeightScannerPrimPathCfg",
     "NonFootContactBodyNamesCfg",
     "RetargetJointRegularizeTargetsCfg",
+    "RetargetFootRotationWeightCfg",
+    "RetargetFootContactWeightCfg",
+    "RetargetMorphPatchOversampleCfg",
+    "RetargetTerrainCollisionMarginCfg",
     "RetargetLateralHipJointPatternCfg",
+    "RetargetMinContactsCfg",
+    "RetargetSnapDistanceCfg",
     "RobotArticulationCfg",
     "SyncFootPairsCfg",
 ]
@@ -24,7 +30,13 @@ from .robot_presets import (
     HeightScannerPrimPathCfg,
     NonFootContactBodyNamesCfg,
     RetargetJointRegularizeTargetsCfg,
+    RetargetFootRotationWeightCfg,
+    RetargetFootContactWeightCfg,
+    RetargetMorphPatchOversampleCfg,
     RetargetLateralHipJointPatternCfg,
+    RetargetMinContactsCfg,
+    RetargetSnapDistanceCfg,
+    RetargetTerrainCollisionMarginCfg,
     RobotArticulationCfg,
     SyncFootPairsCfg,
 )
@@ -35,6 +47,7 @@ from .robot_presets import (
 from .anymal_c import *
 from .anymal_d import *
 from .b2 import *
+from .g1 import *
 from .go2 import *
 from .h1 import *
 from .mewtwo import *

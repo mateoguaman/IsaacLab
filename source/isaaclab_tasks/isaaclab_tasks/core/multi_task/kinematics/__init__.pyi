@@ -6,6 +6,7 @@
 __all__ = [
     "NewtonKinematics",
     "NewtonKinematicsCfg",
+    "add_robot_description",
     "IKObjectiveGravityTorque",
     "IKObjectiveJointDefault",
     "IKObjectiveJointRegularize",
@@ -15,7 +16,7 @@ __all__ = [
     "_build_collision_probes",
 ]
 
-from .newton_kinematics import NewtonKinematics
+from .newton_kinematics import NewtonKinematics, add_robot_description
 from .newton_kinematics_cfg import NewtonKinematicsCfg
 
 from .ik_objectives import (

@@ -29,6 +29,7 @@ from .feature_extractors import (
 )
 from .pipeline import CriterionFn as CriterionFn
 from .pipeline import RetargetPipeline as RetargetPipeline
+from .pipeline import resolve_description_path as resolve_description_path
 from .pipeline import resolve_foot_body_names as resolve_foot_body_names
 from .sampler_base import (
     SamplerBase as SamplerBase,

@@ -3,12 +3,16 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""IK objective: stability margin (CoM inside support polygon).
+"""IK objective: stability margin (CoM inside the support region).
 
-Penalizes configurations where the CoM projects outside the convex hull
-of the foot positions (static instability under gravity). No gradient
-inside the polygon — any interior position is stable — so the objective
-does not bias the solve toward the polygon centroid.
+Penalizes configurations where the CoM projects outside the convex hull of
+the sole outlines of the feet in contact (static instability under gravity).
+No gradient inside the region — any interior position is stable — so the
+objective does not bias the solve toward its centroid.
+
+Building the region from sole outlines rather than foot origins is what lets
+the same objective serve a quadruped on four near-point feet and a humanoid
+on one or two flat soles.
 """
 
 from __future__ import annotations
@@ -123,48 +127,38 @@ def _stability_margin_residuals(
     n_bodies: int,
     foot_body_indices: wp.array1d(dtype=wp.int32),
     is_contact: wp.array2d(dtype=wp.uint8),
-    scratch_xy: wp.array2d(dtype=wp.vec2),
+    hull_local: wp.array2d(dtype=wp.vec2),
+    directions: wp.array1d(dtype=wp.vec2),
+    scratch_world: wp.array2d(dtype=wp.vec3),
     scratch_slot: wp.array2d(dtype=wp.int32),
     n_feet: int,
+    n_vertices: int,
+    n_directions: int,
     total_mass_inv: float,
     weight: float,
     start_idx: int,
     residuals: wp.array2d(dtype=wp.float32),
-    active_a_slot: wp.array1d(dtype=wp.int32),
-    active_b_slot: wp.array1d(dtype=wp.int32),
-    active_e_xy: wp.array1d(dtype=wp.vec2),
-    active_p_xy: wp.array1d(dtype=wp.vec2),
-    active_edge_len: wp.array1d(dtype=wp.float32),
+    active_slot: wp.array1d(dtype=wp.int32),
+    active_vertex_w: wp.array1d(dtype=wp.vec3),
+    active_direction: wp.array1d(dtype=wp.vec2),
 ):
     """Residual = ``max(0, -margin)`` where margin is the signed distance
-    from the CoM (XY projection) to the nearest edge of the *active*
-    support polygon. Only feet with ``is_contact[row, i] != 0`` form
-    polygon vertices; lifted feet are skipped. Active contacts are sorted
-    CCW per-problem by their angle around the active centroid.
+    from the CoM (XY projection) to the boundary of the support region --
+    the convex hull of the sole outlines of every foot in contact.
 
-    Returns zero residual when fewer than 3 feet are in contact (support
-    collapses to a point or segment -- measure-zero stability, left to
-    the :class:`SupportPolygonStability` criterion to gate rigorously).
+    The margin is evaluated by support function: for each probe direction,
+    how far the region reaches minus how far the CoM sits, minimised over
+    directions. That needs no hull ordering, which matters because most
+    sole vertices lie strictly inside the region, and it stays valid at any
+    contact count -- a single sole is a support region in its own right.
 
-    Also writes the active edge cache (``active_*``) used by the analytic
-    Jacobian kernel: foot slot indices forming the violating edge, and
-    the edge / com-vector / edge-length values that the chain rule needs.
-    Sets ``active_a_slot = -1`` when residual = 0 (hinge, no gradient).
+    Also writes the cache the analytic Jacobian reads: the winning
+    direction, the foot slot owning the supporting vertex, and that
+    vertex's world position. By Danskin's theorem the gradient at the
+    optimum only involves those, so the chain rule has a single term.
+    Sets ``active_slot = -1`` when residual = 0 (hinge, no gradient).
     """
     row = wp.tid()
-
-    # Gather active feet xy + their original slot indices into scratch.
-    n_active = int(0)
-    for i in range(n_feet):
-        if is_contact[row, i] != wp.uint8(0):
-            pos = wp.transform_get_translation(body_q[row, foot_body_indices[i]])
-            scratch_xy[row, n_active] = wp.vec2(pos[0], pos[1])
-            scratch_slot[row, n_active] = i
-            n_active = n_active + 1
-    if n_active < 3:
-        residuals[row, start_idx] = 0.0
-        active_a_slot[row] = -1
-        return
 
     # Mass-weighted CoM in XY (over the whole body, not just active feet --
     # physical CoM doesn't care about contact state).
@@ -177,156 +171,121 @@ def _stability_margin_residuals(
     com_x = com_x * total_mass_inv
     com_y = com_y * total_mass_inv
 
-    # Sort active feet CCW by angle around their own centroid (carrying slot ids).
-    cx = float(0.0)
-    cy = float(0.0)
-    for k in range(n_active):
-        v = scratch_xy[row, k]
-        cx = cx + v[0]
-        cy = cy + v[1]
-    inv_n = 1.0 / float(n_active)
-    cx = cx * inv_n
-    cy = cy * inv_n
-    for i in range(n_active):
-        for j in range(i + 1, n_active):
-            vi = scratch_xy[row, i]
-            vj = scratch_xy[row, j]
-            ai = wp.atan2(vi[1] - cy, vi[0] - cx)
-            aj = wp.atan2(vj[1] - cy, vj[0] - cx)
-            if aj < ai:
-                scratch_xy[row, i] = vj
-                scratch_xy[row, j] = vi
-                si = scratch_slot[row, i]
-                sj = scratch_slot[row, j]
-                scratch_slot[row, i] = sj
-                scratch_slot[row, j] = si
+    # Place every sole vertex of every contacting foot in the world once,
+    # so the direction sweep below is dot products against cached points
+    # rather than repeated rigid transforms.
+    n_active = int(0)
+    for f in range(n_feet):
+        if is_contact[row, f] == wp.uint8(0):
+            continue
+        tf = body_q[row, foot_body_indices[f]]
+        for v in range(n_vertices):
+            h = hull_local[f, v]
+            scratch_world[row, n_active] = wp.transform_point(tf, wp.vec3(h[0], h[1], 0.0))
+            scratch_slot[row, n_active] = f
+            n_active = n_active + 1
 
-    # Find the minimum signed distance and remember which edge produced it.
-    min_signed = float(1.0e9)
-    active_i = int(0)
-    for i in range(n_active):
-        j = (i + 1) % n_active
-        vi = scratch_xy[row, i]
-        vj = scratch_xy[row, j]
-        ex = vj[0] - vi[0]
-        ey = vj[1] - vi[1]
-        edge_len = wp.sqrt(ex * ex + ey * ey + 1.0e-12)
-        px = com_x - vi[0]
-        py = com_y - vi[1]
-        signed = (ex * py - ey * px) / edge_len
-        if signed < min_signed:
-            min_signed = signed
-            active_i = i
+    if n_active == 0:
+        residuals[row, start_idx] = 0.0
+        active_slot[row] = -1
+        return
 
-    violation = wp.max(0.0, -min_signed)
+    best_margin = float(1.0e9)
+    best_slot = int(0)
+    best_vertex = wp.vec3(0.0, 0.0, 0.0)
+    best_direction = wp.vec2(0.0, 0.0)
+    for k in range(n_directions):
+        d = directions[k]
+        support = float(-1.0e9)
+        support_slot = int(0)
+        support_vertex = wp.vec3(0.0, 0.0, 0.0)
+        for i in range(n_active):
+            point = scratch_world[row, i]
+            projection = d[0] * point[0] + d[1] * point[1]
+            if projection > support:
+                support = projection
+                support_slot = scratch_slot[row, i]
+                support_vertex = point
+        margin = support - (d[0] * com_x + d[1] * com_y)
+        if margin < best_margin:
+            best_margin = margin
+            best_slot = support_slot
+            best_vertex = support_vertex
+            best_direction = d
+
+    violation = wp.max(0.0, -best_margin)
     residuals[row, start_idx] = weight * violation
 
     if violation > 0.0:
-        i_a = active_i
-        i_b = (active_i + 1) % n_active
-        vi = scratch_xy[row, i_a]
-        vj = scratch_xy[row, i_b]
-        ex = vj[0] - vi[0]
-        ey = vj[1] - vi[1]
-        L = wp.sqrt(ex * ex + ey * ey + 1.0e-12)
-        active_a_slot[row] = scratch_slot[row, i_a]
-        active_b_slot[row] = scratch_slot[row, i_b]
-        active_e_xy[row] = wp.vec2(ex, ey)
-        active_p_xy[row] = wp.vec2(com_x - vi[0], com_y - vi[1])
-        active_edge_len[row] = L
+        active_slot[row] = best_slot
+        active_vertex_w[row] = best_vertex
+        active_direction[row] = best_direction
     else:
-        active_a_slot[row] = -1
+        active_slot[row] = -1
 
 
 @wp.kernel
 def _stability_margin_jac_analytic(
-    body_q: wp.array2d(dtype=wp.transform),
-    foot_body_indices: wp.array1d(dtype=wp.int32),
     foot_in_subtree: wp.array2d(dtype=wp.uint8),
     joint_S_s: wp.array2d(dtype=wp.spatial_vector),
     dof_to_joint: wp.array1d(dtype=wp.int32),
     joint_subtree_mass: wp.array1d(dtype=wp.float32),
     joint_subtree_com: wp.array2d(dtype=wp.vec3),
     total_mass_inv: float,
-    active_a_slot: wp.array1d(dtype=wp.int32),
-    active_b_slot: wp.array1d(dtype=wp.int32),
-    active_e_xy: wp.array1d(dtype=wp.vec2),
-    active_p_xy: wp.array1d(dtype=wp.vec2),
-    active_edge_len: wp.array1d(dtype=wp.float32),
+    active_slot: wp.array1d(dtype=wp.int32),
+    active_vertex_w: wp.array1d(dtype=wp.vec3),
+    active_direction: wp.array1d(dtype=wp.vec2),
     weight: float,
     start_idx: int,
     jacobian: wp.array3d(dtype=wp.float32),
 ):
     """One thread per ``(problem, dof)``. Hinge gradient is 0 inside the
-    polygon (encoded by ``active_a_slot < 0``). When outside, only the
-    active edge contributes; the chain rule combines:
+    support region (encoded by ``active_slot < 0``).
 
-    * Foot velocity at each endpoint via ``v_d + ω_d × pos_foot`` gated
-      by the precomputed ``foot_in_subtree`` membership table.
-    * CoM velocity via ``(M_s / M_total) * (v_d + ω_d × C_s)`` where
-      ``M_s`` and ``C_s`` are the total mass and COM of the subtree of
-      the dof's joint.
+    At the optimum the margin is ``d . (vertex - com)`` for the winning
+    direction ``d`` and supporting sole vertex, and neither the direction
+    nor which vertex wins varies to first order, so
 
-    With ``e = pos_b - pos_a`` and ``p = com - pos_a`` (xy only),
+        d(residual)/dq = -weight * d . (d(vertex)/dq - d(com)/dq)
 
-        s = e_x p_y - e_y p_x,    L = |e|,    signed = s / L
-        residual = -weight * signed   (when active)
+    with
 
-    so
-
-        d(residual)/dq = -weight * (ds/dq * L - s * dL/dq) / L^2.
+    * vertex velocity ``v_d + w_d x vertex``, gated by the precomputed
+      ``foot_in_subtree`` table for the foot owning it. Taking the moment
+      about the vertex itself (rather than the foot origin) is what makes
+      the foot's *rotation* carry gradient, so tipping a sole toward its
+      edge is penalised.
+    * CoM velocity ``(M_s / M_total) * (v_d + w_d x C_s)`` where ``M_s``
+      and ``C_s`` are the mass and COM of the subtree of the dof's joint.
 
     Assumes ``jacobian`` is zeroed upstream. Returns without writing for
     inactive (problem, dof) pairs.
     """
     p, d = wp.tid()
 
-    a_slot = active_a_slot[p]
-    if a_slot < 0:
+    slot = active_slot[p]
+    if slot < 0:
         return
 
-    b_slot = active_b_slot[p]
-    e_xy = active_e_xy[p]
-    p_xy = active_p_xy[p]
-    L = active_edge_len[p]
-
-    a_body = foot_body_indices[a_slot]
-    b_body = foot_body_indices[b_slot]
-    pos_a = wp.transform_get_translation(body_q[p, a_body])
-    pos_b = wp.transform_get_translation(body_q[p, b_body])
+    vertex = active_vertex_w[p]
+    direction = active_direction[p]
 
     S = joint_S_s[p, d]
     v = wp.vec3(S[0], S[1], S[2])
     omega = wp.vec3(S[3], S[4], S[5])
 
-    d_pos_a = wp.vec3(0.0, 0.0, 0.0)
-    if foot_in_subtree[a_slot, d] != wp.uint8(0):
-        d_pos_a = v + wp.cross(omega, pos_a)
-    d_pos_b = wp.vec3(0.0, 0.0, 0.0)
-    if foot_in_subtree[b_slot, d] != wp.uint8(0):
-        d_pos_b = v + wp.cross(omega, pos_b)
+    d_vertex = wp.vec3(0.0, 0.0, 0.0)
+    if foot_in_subtree[slot, d] != wp.uint8(0):
+        d_vertex = v + wp.cross(omega, vertex)
 
     j_d = dof_to_joint[d]
     M_s = joint_subtree_mass[j_d]
     C_s = joint_subtree_com[p, j_d]
     d_com = (M_s * total_mass_inv) * (v + wp.cross(omega, C_s))
 
-    d_ex = d_pos_b[0] - d_pos_a[0]
-    d_ey = d_pos_b[1] - d_pos_a[1]
-    d_px = d_com[0] - d_pos_a[0]
-    d_py = d_com[1] - d_pos_a[1]
+    d_margin = direction[0] * (d_vertex[0] - d_com[0]) + direction[1] * (d_vertex[1] - d_com[1])
 
-    ex = e_xy[0]
-    ey = e_xy[1]
-    px = p_xy[0]
-    py = p_xy[1]
-
-    d_s = d_ex * py + ex * d_py - d_ey * px - ey * d_px
-    d_L = (ex * d_ex + ey * d_ey) / L
-    s = ex * py - ey * px
-    d_signed = (d_s * L - s * d_L) / (L * L)
-
-    jacobian[p, start_idx, d] = -weight * d_signed
+    jacobian[p, start_idx, d] = -weight * d_margin
 
 
 class IKObjectiveStabilityMargin(ik.IKObjective):
@@ -357,6 +316,17 @@ class IKObjectiveStabilityMargin(ik.IKObjective):
         self.weight = cfg.weight
         self._foot_body_indices_np = np.asarray(pipeline.foot_body_ids, dtype=np.int32)
         self.n_feet = int(self._foot_body_indices_np.shape[0])
+        # Sole outline per foot, in the foot's own xy frame. Derived from the
+        # robot's collision geometry, so a flat humanoid sole contributes its
+        # full outline and a spherical quadruped foot nearly a point.
+        self._hull_local_np = pipeline.kin.foot_contact_hulls(
+            list(pipeline.foot_body_ids),
+            height_tol=cfg.contact_height_tol,
+        )["vertices"]
+        self.n_vertices = int(self._hull_local_np.shape[1])
+        angles = np.arange(cfg.num_directions, dtype=np.float32) * (2.0 * np.pi / cfg.num_directions)
+        self._directions_np = np.stack([np.cos(angles), np.sin(angles)], axis=-1).astype(np.float32)
+        self.n_directions = int(cfg.num_directions)
         model = pipeline.kin.model
         self.n_bodies = model.body_count
         self.n_joints = model.joint_count
@@ -396,16 +366,18 @@ class IKObjectiveStabilityMargin(ik.IKObjective):
         self._is_contact_t = is_c_u8  # keep torch reference alive for Warp view
         self._is_contact = wp.from_torch(is_c_u8, dtype=wp.uint8)
 
-        self._scratch_xy = wp.zeros(shape=(n, self.n_feet), dtype=wp.vec2, device=d)
-        self._scratch_slot = wp.zeros(shape=(n, self.n_feet), dtype=wp.int32, device=d)
+        self._hull_local = wp.array(self._hull_local_np, dtype=wp.vec2, device=d)
+        self._directions = wp.array(self._directions_np, dtype=wp.vec2, device=d)
 
-        # Active-edge cache populated by the residual kernel and read by
+        n_slots = self.n_feet * self.n_vertices
+        self._scratch_world = wp.zeros(shape=(n, n_slots), dtype=wp.vec3, device=d)
+        self._scratch_slot = wp.zeros(shape=(n, n_slots), dtype=wp.int32, device=d)
+
+        # Supporting-vertex cache populated by the residual kernel and read by
         # the analytic Jacobian kernel on the same iteration.
-        self._active_a_slot = wp.zeros(shape=(n,), dtype=wp.int32, device=d)
-        self._active_b_slot = wp.zeros(shape=(n,), dtype=wp.int32, device=d)
-        self._active_e_xy = wp.zeros(shape=(n,), dtype=wp.vec2, device=d)
-        self._active_p_xy = wp.zeros(shape=(n,), dtype=wp.vec2, device=d)
-        self._active_edge_len = wp.zeros(shape=(n,), dtype=wp.float32, device=d)
+        self._active_slot = wp.zeros(shape=(n,), dtype=wp.int32, device=d)
+        self._active_vertex_w = wp.zeros(shape=(n,), dtype=wp.vec3, device=d)
+        self._active_direction = wp.zeros(shape=(n,), dtype=wp.vec2, device=d)
 
         # Per-joint subtree COM (refreshed every iteration in compute_residuals).
         self._dof_to_joint = wp.array(self._dof_to_joint_np, dtype=wp.int32, device=d)
@@ -448,26 +420,28 @@ class IKObjectiveStabilityMargin(ik.IKObjective):
                 self.n_bodies,
                 self._foot_body_indices,
                 self._is_contact,
-                self._scratch_xy,
+                self._hull_local,
+                self._directions,
+                self._scratch_world,
                 self._scratch_slot,
                 self.n_feet,
+                self.n_vertices,
+                self.n_directions,
                 self._total_mass_inv,
                 self.weight,
                 start_idx,
             ],
             outputs=[
                 residuals,
-                self._active_a_slot,
-                self._active_b_slot,
-                self._active_e_xy,
-                self._active_p_xy,
-                self._active_edge_len,
+                self._active_slot,
+                self._active_vertex_w,
+                self._active_direction,
             ],
             device=self.device,
         )
 
     def compute_jacobian_analytic(self, body_q, joint_q, model, jacobian, joint_S_s, start_idx) -> None:
-        """Reads the active-edge cache populated by the most recent
+        """Reads the supporting-vertex cache populated by the most recent
         :meth:`compute_residuals` call. Newton's IK solver always evaluates
         residuals before Jacobians per iteration, so the cache is fresh.
         """
@@ -477,19 +451,15 @@ class IKObjectiveStabilityMargin(ik.IKObjective):
             _stability_margin_jac_analytic,
             dim=[self.n_batch, n_dofs],
             inputs=[
-                body_q,
-                self._foot_body_indices,
                 self._foot_in_subtree,
                 joint_S_s,
                 self._dof_to_joint,
                 self._joint_subtree_mass,
                 self._joint_subtree_com_buf,
                 self._total_mass_inv,
-                self._active_a_slot,
-                self._active_b_slot,
-                self._active_e_xy,
-                self._active_p_xy,
-                self._active_edge_len,
+                self._active_slot,
+                self._active_vertex_w,
+                self._active_direction,
                 self.weight,
                 start_idx,
             ],

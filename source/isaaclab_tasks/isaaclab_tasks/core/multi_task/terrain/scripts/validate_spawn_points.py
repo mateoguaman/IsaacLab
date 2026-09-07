@@ -116,13 +116,18 @@ def _eager_load_presets() -> None:
 
 
 def _resolve_robot_usd(robot_cfg) -> str:
-    """Return the robot's USD path, downloading from Nucleus if needed."""
+    """Return the robot's description path (USD or URDF), downloading from Nucleus if needed."""
     from isaaclab.utils.assets import check_file_path, retrieve_file_path
 
-    usd_path = robot_cfg.spawn.usd_path
+    from isaaclab_tasks.core.multi_task.terrain.retarget import resolve_description_path
+
+    usd_path = resolve_description_path(robot_cfg.spawn)
     status = check_file_path(usd_path)
     if status == 0:
-        raise FileNotFoundError(f"USD not found: {usd_path}")
+        raise FileNotFoundError(
+            f"Robot description not found: {usd_path}\n"
+            "If this is a fetched bundle, run: ./isaaclab.sh -p scripts/fetch_robot_descriptions.py"
+        )
     if status == 2:
         usd_path = retrieve_file_path(usd_path, force_download=False)
     return usd_path
@@ -301,16 +306,49 @@ def main():
         action="store_true",
         help="Skip the viser viewer; print diagnostics and exit.",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=VISER_PORT,
+        help=f"Port for the viser web server (default {VISER_PORT}).",
+    )
+    parser.add_argument(
+        "--polygon_limit",
+        type=int,
+        default=3000,
+        help=(
+            "Maximum support polygons drawn per outcome group. Each polygon is a handful of line"
+            " segments, so a full terrain's worth swamps the browser; an evenly-spread subset shows"
+            " the same distribution. 0 draws all."
+        ),
+    )
+    parser.add_argument(
+        "--show_collision",
+        action="store_true",
+        help=(
+            "Draw each robot's collision geometry instead of its visual meshes, which is what the IK"
+            " criteria and the terrain-collision objective actually reason about."
+        ),
+    )
+    parser.add_argument(
+        "--vis_limit",
+        type=int,
+        default=200,
+        help=(
+            "Maximum articulated robots drawn in the viewer. Each one costs a USD load, so drawing every"
+            " placement is slow. Foot points and support polygons are always drawn in full. 0 draws all."
+        ),
+    )
     # Set the registration guard BEFORE importing any ``isaaclab_tasks`` submodule, so the
     # package __init__ does not eagerly import every (Isaac-Sim-coupled) task package.
     _set_registration_guard()
 
-    from isaaclab_tasks.utils import fold_preset_tokens, setup_preset_cli
+    from isaaclab_tasks.utils import setup_preset_cli
 
     args, remaining = setup_preset_cli(parser)
     # Hand the leftover preset / Hydra-override tokens to ``resolve_task_config`` through
     # ``sys.argv``, mirroring scripts/reinforcement_learning/rsl_rl/train.py.
-    sys.argv = [sys.argv[0]] + fold_preset_tokens(remaining)
+    sys.argv = [sys.argv[0]] + remaining
     selected = {
         name
         for token in sys.argv[1:]
@@ -455,7 +493,15 @@ def main():
     ct_np = buf.contact_targets_t.cpu().numpy()
     cpc = kin.model.joint_coord_count
 
-    solved_qs = [jq_results[idx] for idx in sel]
+    # Drawing an articulated robot costs one USD load each, so cap how many are
+    # rendered. Foot points and support polygons below stay complete -- they are
+    # the actual distribution and cost nothing to draw.
+    vis_sel = sel
+    if args.vis_limit > 0 and len(sel) > args.vis_limit:
+        vis_sel = sel[np.linspace(0, len(sel) - 1, args.vis_limit).astype(np.int64)]
+        print(f"  Drawing {len(vis_sel)} of {len(sel)} placements (--vis_limit); polygons show all.")
+
+    solved_qs = [jq_results[idx] for idx in vis_sel]
     selected_feet = [ct_np[idx * nc : (idx + 1) * nc] for idx in sel]
 
     vis_builder = newton.ModelBuilder()
@@ -469,8 +515,10 @@ def main():
     )
 
     if solved_qs:
+        from isaaclab_tasks.core.multi_task.kinematics import add_robot_description
+
         template = newton.ModelBuilder()
-        template.add_usd(robot_usd, collapse_fixed_joints=False)
+        add_robot_description(template, robot_usd, collapse_fixed_joints=False, show_colliders=args.show_collision)
         for _ in solved_qs:
             vis_builder.add_world(template)
 
@@ -489,7 +537,7 @@ def main():
         vis_state,
     )
 
-    viewer = ViewerViser(port=VISER_PORT)
+    viewer = ViewerViser(port=args.port)
     viewer.set_model(vis_model)
     viewer.set_world_offsets((0.0, 0.0, 0.0))
 
@@ -554,6 +602,21 @@ def main():
         filtered_idx = np.nonzero(ik_valid_np & ~selected_mask)[0]
         passed_idx = sel
 
+        def _thin(indices: np.ndarray) -> np.ndarray:
+            """Evenly spread subset of ``indices``, honouring ``--polygon_limit``."""
+            if args.polygon_limit <= 0 or indices.size <= args.polygon_limit:
+                return indices
+            return indices[np.linspace(0, indices.size - 1, args.polygon_limit).astype(np.int64)]
+
+        group_totals = {
+            "criteria-rejected": rejected_idx.size,
+            "bucket-filtered": filtered_idx.size,
+            "selected": passed_idx.size,
+        }
+        rejected_idx = _thin(rejected_idx)
+        filtered_idx = _thin(filtered_idx)
+        passed_idx = _thin(passed_idx)
+
         feet_all = ct_np.reshape(-1, nc, 3)  # [max_candidates, nc, 3]
 
         def _polygon_edges(indices: np.ndarray, lift_z: float = 0.015):
@@ -586,11 +649,16 @@ def main():
                 colors=color,
                 width=0.004,
             )
-        print(
-            f"  Support polygons: {len(rejected_idx)} criteria-rejected (red),"
-            f" {len(filtered_idx)} bucket-filtered (orange),"
-            f" {len(passed_idx)} selected (green)"
+        drawn = {
+            "criteria-rejected": len(rejected_idx),
+            "bucket-filtered": len(filtered_idx),
+            "selected": len(passed_idx),
+        }
+        summary = ", ".join(
+            f"{drawn[k]} of {group_totals[k]} {k}" if drawn[k] != group_totals[k] else f"{group_totals[k]} {k}"
+            for k in group_totals
         )
+        print(f"  Support polygons: {summary}")
 
         # Active-support polygon overlay: only the *contact* feet per
         # selected placement. For 4-contact this overlaps green; for
@@ -634,8 +702,8 @@ def main():
     viewer.end_frame()
 
     hn = socket.gethostname()
-    print(f"\n  http://localhost:{VISER_PORT}")
-    print(f"  http://{hn}:{VISER_PORT}")
+    print(f"\n  http://localhost:{args.port}")
+    print(f"  http://{hn}:{args.port}")
     print("  Dots: Green=candidates, Cyan=selected feet, Red=collision probes")
     print("  Polygons: Red=criteria-rejected, Orange=bucket-filtered, Green=selected")
     print(f"\n  {len(solved_qs)} robots placed.")
