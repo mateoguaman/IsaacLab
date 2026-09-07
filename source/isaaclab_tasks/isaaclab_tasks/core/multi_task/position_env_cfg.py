@@ -146,7 +146,7 @@ class PositionPhysicsCfg(PresetCfg):
     default = PhysxCfg(
         gpu_total_aggregate_pairs_capacity=2**25,
         gpu_found_lost_pairs_capacity=2**25,
-        gpu_collision_stack_size=2**31,
+        gpu_collision_stack_size=2**29,
         gpu_max_rigid_patch_count=5 * 2**20,
     )
     newton_mjwarp = NewtonCfg(
