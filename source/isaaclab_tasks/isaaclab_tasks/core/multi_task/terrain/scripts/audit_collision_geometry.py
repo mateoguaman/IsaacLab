@@ -23,7 +23,6 @@ sys.path[:] = [p for p in sys.path if "pip_prebundle" not in p and "pip_archive"
 
 import argparse
 
-import numpy as np
 import warp as wp
 
 
@@ -32,9 +31,8 @@ def main() -> None:
     parser.add_argument("--margin", type=float, default=0.05, help="Terrain-collision objective margin [m].")
     parser.add_argument("--probe_samples", type=int, default=4, help="Probes per body, matching the objective cfg.")
 
-    from isaaclab_tasks.utils import setup_preset_cli
-
     import isaaclab_tasks.core.multi_task.terrain.scripts.validate_spawn_points as vsp
+    from isaaclab_tasks.utils import setup_preset_cli
 
     vsp._set_registration_guard()
     args, remaining = setup_preset_cli(parser)
@@ -110,11 +108,15 @@ def main() -> None:
     )
     n_gated = sum(1 for s in probe_slots if s >= 0)
     print()
-    print(f"  collision probes: {len(probe_bodies)} total, {n_gated} on feet (gated by contact), {len(probe_bodies) - n_gated} always active")
+    print(
+        f"  collision probes: {len(probe_bodies)} total, {n_gated} on feet (gated by contact), {len(probe_bodies) - n_gated} always active"
+    )
 
     print()
     if offenders:
-        print(f"  {len(offenders)} non-foot bodies sit within the {args.margin * 1000:.0f} mm margin at the default stance:")
+        print(
+            f"  {len(offenders)} non-foot bodies sit within the {args.margin * 1000:.0f} mm margin at the default stance:"
+        )
         for name, lowest in sorted(offenders, key=lambda kv: kv[1]):
             print(f"    {name:32s} lowest {lowest * 1000:7.1f} mm above the sole plane")
         print()

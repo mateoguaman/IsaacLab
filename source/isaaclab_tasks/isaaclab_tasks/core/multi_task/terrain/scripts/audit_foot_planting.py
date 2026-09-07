@@ -56,7 +56,9 @@ def _terrain_height_under(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--planted_tol", type=float, default=0.02, help="Clearance below which a foot counts as planted [m].")
+    parser.add_argument(
+        "--planted_tol", type=float, default=0.02, help="Clearance below which a foot counts as planted [m]."
+    )
     parser.add_argument("--dump", type=int, default=8, help="Worst-offender placements to print.")
     parser.add_argument(
         "--min_support",
@@ -67,9 +69,8 @@ def main() -> None:
     parser.add_argument("--max_robots", type=int, default=None, help="Placement budget override.")
     parser.add_argument("--spacing", type=float, default=None, help="Placement spacing override [m].")
 
-    from isaaclab_tasks.utils import setup_preset_cli
-
     import isaaclab_tasks.core.multi_task.terrain.scripts.validate_spawn_points as vsp
+    from isaaclab_tasks.utils import setup_preset_cli
 
     vsp._set_registration_guard()
     args, remaining = setup_preset_cli(parser)
@@ -100,7 +101,9 @@ def main() -> None:
     extractor = pipeline_cfg.sampler.sizing.fps_features
     n_desired = vsp._derive_n_desired(args, table_cfg.pool_spacing, x_range, y_range, extractor)
     pipeline_cfg = pipeline_cfg.replace(
-        sampler=pipeline_cfg.sampler.replace(sizing=pipeline_cfg.sampler.sizing.replace(fps_spacing=table_cfg.pool_spacing))
+        sampler=pipeline_cfg.sampler.replace(
+            sizing=pipeline_cfg.sampler.sizing.replace(fps_spacing=table_cfg.pool_spacing)
+        )
     )
 
     pipeline = RetargetPipeline(pipeline_cfg)
@@ -245,8 +248,10 @@ def main() -> None:
     base_drift_xy = (base_pos[:, :2] - base_target[:, :2]).norm(dim=-1)
     residual_xy = (foot_pos[..., :2] - targets[..., :2]).norm(dim=-1)
     print()
-    print(f"  base drift from its sampler target: median={base_drift.median().item() * 1000:7.1f} mm"
-          f"  (xy only {base_drift_xy.median().item() * 1000:7.1f} mm)")
+    print(
+        f"  base drift from its sampler target: median={base_drift.median().item() * 1000:7.1f} mm"
+        f"  (xy only {base_drift_xy.median().item() * 1000:7.1f} mm)"
+    )
 
     print()
     print(f"  error split (foot_ground_offset = {ground_offset * 1000:.1f} mm)")
@@ -279,8 +284,10 @@ def main() -> None:
         print(f"    row={int(sel[row]):7d}  base_z={base_z:6.3f}  clearance={cl}  contact={fl}")
 
     print()
-    print(f"  summary: {int((n_planted == nc).sum()) / n_sel * 100:.1f}% of placements have every foot planted;"
-          f" {int((n_planted == 0).sum()) / n_sel * 100:.1f}% have none")
+    print(
+        f"  summary: {int((n_planted == nc).sum()) / n_sel * 100:.1f}% of placements have every foot planted;"
+        f" {int((n_planted == 0).sum()) / n_sel * 100:.1f}% have none"
+    )
     _ = worst
 
 
