@@ -109,13 +109,15 @@ def main() -> None:
     n_gated = sum(1 for s in probe_slots if s >= 0)
     print()
     print(
-        f"  collision probes: {len(probe_bodies)} total, {n_gated} on feet (gated by contact), {len(probe_bodies) - n_gated} always active"
+        f"  collision probes: {len(probe_bodies)} total, {n_gated} on feet (gated by contact),"
+        f" {len(probe_bodies) - n_gated} always active"
     )
 
     print()
     if offenders:
         print(
-            f"  {len(offenders)} non-foot bodies sit within the {args.margin * 1000:.0f} mm margin at the default stance:"
+            f"  {len(offenders)} non-foot bodies sit within the {args.margin * 1000:.0f} mm margin"
+            " at the default stance:"
         )
         for name, lowest in sorted(offenders, key=lambda kv: kv[1]):
             print(f"    {name:32s} lowest {lowest * 1000:7.1f} mm above the sole plane")
