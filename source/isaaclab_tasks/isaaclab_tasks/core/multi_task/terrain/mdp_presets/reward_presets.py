@@ -11,6 +11,7 @@ from isaaclab.utils.configclass import configclass
 from isaaclab_tasks.utils import PresetCfg
 
 from .. import mdp
+from .robots.robot_presets import NonFootContactBodyNamesCfg
 
 
 @configclass
@@ -20,10 +21,16 @@ class PositionRewardsCfg:
 
     mech_work = RewTerm(func=mdp.mechanical_power, weight=-0.000025)
 
+    # Penalize contact on anything that is not a foot. The body pattern is
+    # per-robot: matching on ``FOOT`` names every body on a robot whose feet
+    # are named otherwise, which turns this into a penalty for standing.
     undesired_contact = RewTerm(
         func=mdp.undesired_contacts,
         weight=-0.01,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="^(?!.*(?:(FOOT))).*$"), "threshold": 1.0},
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=NonFootContactBodyNamesCfg()),  # type: ignore[arg-type]
+            "threshold": 1.0,
+        },
     )
 
 
