@@ -369,6 +369,24 @@ singularity exec \
     ' _ "${DIST_ARGS[@]}" "$CLUSTER_PYTHON_EXECUTABLE" "${CLI_ARGS[@]}" --distributed
 EXIT_CODE=$?
 
+# On failure, rescue Kit's breakpad crash dumps before the job-tmp is wiped.
+# They hold the native stack for crashes that never reach a Python traceback.
+if [ "$EXIT_CODE" -ne 0 ]; then
+    dump_dest="$CLUSTER_ISAACLAB_DIR/logs/crash_dumps/${SLURM_JOB_ID}"
+    shopt -s nullglob globstar
+    dumps=("$JOB_TMPDIR"/container_tmp/**/*.dmp "$JOB_TMPDIR"/docker-isaac-sim/**/*.dmp)
+    if [ ${#dumps[@]} -gt 0 ]; then
+        mkdir -p "$dump_dest"
+        for dump_file in "${dumps[@]}"; do
+            cp "$dump_file" "$dump_dest/" && echo "[INFO] Rescued crash dump: $(basename "$dump_file")"
+        done
+        echo "[INFO] Crash dumps saved to $dump_dest"
+    else
+        echo "[INFO] Job failed with code $EXIT_CODE; no breakpad dumps found."
+    fi
+    shopt -u nullglob globstar
+fi
+
 # Debug-only: core-dump rescue. Copies any core files the job produced into
 # $CLUSTER_ISAACLAB_DIR/logs/cores/ before the job-tmp is wiped. Checks three
 # possible locations: the job-local workspace (if core_pattern wrote there),
@@ -422,3 +440,7 @@ if $REMOVE_CODE_COPY_AFTER_JOB; then
 fi
 
 echo "(run_singularity.sh): Return"
+
+# Hand the training exit code back to srun so the submit script sees it.
+# Defaults to 0 for the paths that return before the training launch.
+exit "${EXIT_CODE:-0}"

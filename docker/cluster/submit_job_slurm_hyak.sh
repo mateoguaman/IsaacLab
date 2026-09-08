@@ -78,8 +78,13 @@ CONSTRAINT_PLACEHOLDER
 REQUEUE_PLACEHOLDER
 
 # --- Requeue Handler for Time Limits and Preemption ---
+# ``REQUEUED`` separates a signal-driven requeue from a real training failure.
+# A signal makes ``wait`` return 128+signum, so without this flag a normal
+# preemption would look identical to a crash once the exit code is propagated.
+REQUEUED=0
 requeue_handler() {
     echo "[$(date)] Caught signal: $1 - marking job $SLURM_JOB_ID for requeue"
+    REQUEUED=1
     scontrol requeue $SLURM_JOB_ID
 }
 
@@ -113,6 +118,14 @@ wait $!
 EXIT_CODE=$?
 
 echo "[$(date)] Job finished with exit code: $EXIT_CODE"
+
+# Propagate the training exit code so a failed run is recorded as FAILED
+# instead of COMPLETED. Requeues exit 0: scontrol requeue already ran, and a
+# non-zero status there would flag every preemption as a failure.
+if [ "$REQUEUED" -eq 1 ]; then
+    exit 0
+fi
+exit $EXIT_CODE
 EOFSCRIPT
 
 # Replace placeholders with actual values
