@@ -231,6 +231,21 @@ RUN set -o pipefail \
  && mkdir -p ${dirs} \
  && chown -R isaaclab:isaaclab ${dirs}
 
+# The image carries two Warp copies: the omni.warp.core Kit extension and the
+# pip install in Kit's site-packages. ``warp.fem`` loads from the extension
+# while ``warp._src.utils`` resolves to site-packages, so importing newton
+# fails when the two versions disagree. Point the extension's package at
+# site-packages so both halves match. The extension directory itself stays in
+# place because isaacsim.asset.importer.urdf depends on omni.warp.core.
+RUN set -o pipefail \
+ && sp_warp="$(${ISAACSIM_ROOT_PATH}/python.sh -c 'import sysconfig, os; print(os.path.join(sysconfig.get_paths()["purelib"], "warp"))' | tail -1)" \
+ && for ext_warp in ${ISAACSIM_ROOT_PATH}/extscache/omni.warp.core-*/warp; do \
+        [ -d "${ext_warp}" ] && [ ! -L "${ext_warp}" ] || continue; \
+        [ -d "${sp_warp}" ] || { echo "site-packages warp not found at ${sp_warp}"; exit 1; }; \
+        rm -rf "${ext_warp}" && ln -s "${sp_warp}" "${ext_warp}" \
+        && echo "linked ${ext_warp} -> ${sp_warp}"; \
+    done
+
 USER isaaclab
 
 # make working directory as the Isaac Lab directory
