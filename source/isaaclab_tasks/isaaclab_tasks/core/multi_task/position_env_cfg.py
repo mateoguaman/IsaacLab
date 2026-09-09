@@ -177,11 +177,15 @@ class LocomotionPositionCommandEnvCfg(ManagerBasedRLEnvCfg):
     terminations: mdp_presets.TerminationsCfg = mdp_presets.TerminationsCfg()
     events: EventsCfg = EventsCfg()
     curriculum: mdp_presets.CurriculumPresetCfg = mdp_presets.CurriculumPresetCfg()
+    # ``asset_root`` reads the robot's root pose directly. ``asset_body`` validates the
+    # body name against the articulation view, which is not populated when the viewport
+    # controller first runs, so video capture aborts before recording. The eye sits high
+    # enough to look over the walls and boxes that the terrains put beside the robot.
     viewer: ViewerCfg = ViewerCfg(
-        eye=(4.0 / 4, 7.0 / 4, 7.0 / 4),
-        origin_type="asset_body",
+        eye=(4.0, 4.0, 3.5),
+        lookat=(0.0, 0.0, 0.5),
+        origin_type="asset_root",
         asset_name="robot",
-        body_name=mdp_presets.BaseBodyNameCfg(),  # type: ignore
     )
 
     def __post_init__(self):

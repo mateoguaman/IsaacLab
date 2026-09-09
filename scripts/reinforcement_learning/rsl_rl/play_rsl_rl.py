@@ -172,8 +172,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         if version.parse(installed_version) >= version.parse("4.0.0"):
             # use the new export functions for rsl-rl >= 4.0.0
-            runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-            runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+            try:
+                runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
+                runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+            except (RuntimeError, NotImplementedError):
+                print("[INFO]: JIT/ONNX export not supported for this algorithm, skipping.")
             policy_nn = None  # Not needed for rsl-rl >= 4.0.0
         else:
             # extract the neural network for rsl-rl < 4.0.0

@@ -54,7 +54,8 @@ from .robot_presets import (
     SyncFootPairsCfg,
 )
 
-G1_URDF_PATH = str(Path(ISAACLAB_ASSETS_DATA_DIR) / "unitree_description" / "urdf" / "g1" / "main.urdf")
+G1_DESCRIPTION_DIR = str(Path(ISAACLAB_ASSETS_DATA_DIR) / "unitree_description")
+G1_URDF_PATH = str(Path(G1_DESCRIPTION_DIR) / "urdf" / "g1" / "main.urdf")
 """Hands-free 29-DoF G1 description, populated by ``scripts/fetch_robot_descriptions.py``."""
 
 
@@ -106,9 +107,11 @@ _G1_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
         asset_path=G1_URDF_PATH,
         fix_base=False,
-        # The URDF models each shin and forearm as a cylinder; capsules give the
-        # same silhouette without the flat end caps that snag on terrain edges.
-        replace_cylinders_with_capsules=True,
+        # The URDF refers to its meshes as ``package://unitree_description/...``, so the
+        # importer needs the package root to resolve them. Without this the visual meshes
+        # are dropped and the robot converts to empty link transforms.
+        ros_package_paths=[{"name": "unitree_description", "path": G1_DESCRIPTION_DIR}],
+        robot_type="Humanoid",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
