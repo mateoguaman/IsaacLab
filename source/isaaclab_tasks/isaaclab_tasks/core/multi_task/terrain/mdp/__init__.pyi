@@ -35,6 +35,7 @@ __all__ = [
     "exploration_reward",
     "contact_penalty",
     "success_terminate",
+    "root_height_above_terrain_below_minimum",
     "abnormal_robot_state",
     "out_of_bound",
     "DefaultJointPositionStaticActionCfg",
@@ -102,6 +103,7 @@ from .terminations import (
     time_out_reach_truncate,
     time_out_track_terminate,
     success_terminate,
+    root_height_above_terrain_below_minimum,
 )
 from .actions import DefaultJointPositionStaticActionCfg, DefaultJointPositionStaticAction
 from .events import record_trajectory_video

@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from isaaclab.managers import SceneEntityCfg
+
 if TYPE_CHECKING:
+    from isaaclab.assets import Articulation
     from isaaclab.envs import ManagerBasedRLEnv
 
     from ...mdp.commands.state_command.state_command import StateCommand
@@ -71,3 +74,45 @@ def time_out_track_terminate(env: ManagerBasedRLEnv, command_name: str = "goal_p
     cmd = env.command_manager.get_term(command_name)
     timeout = env.episode_length_buf >= cmd.effective_max_episode_length
     return timeout & ~cmd.spec.task_has_instant[cmd.task_samples]
+
+
+def root_height_above_terrain_below_minimum(
+    env: ManagerBasedRLEnv,
+    minimum_height: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+) -> torch.Tensor:
+    """Terminate when the root sits closer than ``minimum_height`` [m] to the terrain below it.
+
+    The terrains span tens of metres of elevation, so an absolute world-z threshold cannot
+    separate a fallen robot from one standing on a low tile. Local ground level comes from the
+    height scanner's ray hit nearest the root in XY — the patch spans metres and would
+    otherwise average in a step ahead or a pit rim beside the robot. Rays that miss (gaps,
+    pits, bottomless tiles) return non-finite hits and are excluded, so a robot at the edge of
+    a hole is measured against ground it can actually see. Envs whose rays all miss never fire.
+
+    Args:
+        env: The environment instance.
+        minimum_height: Root clearance above the local terrain below which the episode ends [m].
+        asset_cfg: The articulation whose root height is checked.
+        sensor_cfg: The ray-caster sensor supplying local terrain height.
+
+    Returns:
+        Boolean tensor, shape ``[num_envs]``, true where the root is too low.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_cfg.name]
+
+    root_pos = asset.data.root_pos_w.torch
+    hits = sensor.data.ray_hits_w.torch
+    finite = torch.isfinite(hits).all(dim=-1)
+
+    # Nearest hit in XY; missed rays are pushed to +inf so they lose the argmin.
+    xy_dist = torch.linalg.norm(hits[..., :2] - root_pos[:, None, :2], dim=-1)
+    xy_dist = torch.where(finite, xy_dist, torch.inf)
+    nearest = xy_dist.argmin(dim=1)
+    ground_z = hits[torch.arange(hits.shape[0], device=hits.device), nearest, 2]
+
+    # No hit anywhere: fall back to the root height so the clearance is zero-free and large.
+    ground_z = torch.where(finite.any(dim=1), ground_z, root_pos[:, 2])
+    return (root_pos[:, 2] - ground_z) < minimum_height

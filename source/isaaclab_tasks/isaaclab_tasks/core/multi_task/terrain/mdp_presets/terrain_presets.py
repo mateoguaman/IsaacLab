@@ -31,6 +31,16 @@ class SubTerrainPresetCfg(PresetCfg):
         "random_parallel_box": terrains.RANDOM_PARALLEL_BOX_CURRICULUM,
         "balancing_beam": terrains.BALANCING_BEAM_CURRICULUM,
     }
+    basic = {
+        "gap": terrains.GAP_CURRICULUM,
+        "pit": terrains.PIT_CURRICULUM,
+        "extreme_stair": terrains.EXTREME_STAIR_CURRICULUM,
+        "slope_inv": terrains.SLOPE_INV_CURRICULUM,
+        "stepping_stone": terrains.STEPPING_STONE_CURRICULUM,
+    }
+    """Five-terrain subset of :attr:`terrain_curriculum`, for runs that should master fewer
+    terrain types before facing the full set."""
+
     gap = {"gap": terrains.GAP}
     pit = {"pit": terrains.PIT}
     extreme_stair = {"extreme_stair": terrains.EXTREME_STAIR}

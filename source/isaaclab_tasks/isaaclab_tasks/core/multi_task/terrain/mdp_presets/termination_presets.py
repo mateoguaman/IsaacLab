@@ -40,6 +40,11 @@ class PositionTerminationsCfg(BaseTerminationsCfg):
     - ``joint_reaction`` — fires when a joint's measured reaction force exceeds
       6× its effort limit (via the ``joint_wrench`` sensor); mechanical-overload
       guard carried over from the legacy position stack.
+    - ``fallen`` — fires when the root sits under 0.1 m above the terrain below it.
+      ``base_contact`` only catches impacts above 3× bodyweight, so a robot that
+      collapses gently and lies still stays under that bar and runs out the whole
+      episode. Height is measured against the height scanner rather than world z,
+      because the terrains span tens of metres of elevation.
     - ``success`` — episode-success termination from the goal-tracking command.
     """
 
@@ -64,6 +69,17 @@ class PositionTerminationsCfg(BaseTerminationsCfg):
         params={
             "sensor_cfg": SceneEntityCfg("joint_wrench"),
             "force_ratio": 6.0,
+        },
+    )
+
+    # time_out is left False: a fall is a real failure, so the value function should not
+    # bootstrap off it. No paired reward term either — the cost is the forgone success.
+    fallen = DoneTerm(
+        func=mdp.root_height_above_terrain_below_minimum,
+        params={
+            "minimum_height": 0.1,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
         },
     )
 
