@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 
+from isaaclab.envs import mdp as base_mdp
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
@@ -20,6 +21,9 @@ class PositionRewardsCfg:
     success = RewTerm(func=mdp.command_success, weight=5.0)
 
     mech_work = RewTerm(func=mdp.mechanical_power, weight=-0.000025)
+
+    # Weight is set per run; 0.0 leaves the term inactive.
+    joint_deviation = RewTerm(func=base_mdp.joint_deviation_l1, weight=0.0)
 
     # Penalize contact on anything that is not a foot. The body pattern is
     # per-robot: matching on ``FOOT`` names every body on a robot whose feet

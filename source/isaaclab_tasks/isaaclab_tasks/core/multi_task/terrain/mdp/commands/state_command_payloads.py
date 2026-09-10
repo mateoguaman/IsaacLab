@@ -143,14 +143,12 @@ class CommandPayloadBase:
         translations, orientations, scales, marker_indices = [], [], [], []
         if len(pos_task_ids) > 0:
             goal_pos = self.cmd_buf[pos_task_ids, 0, :3].clone()
-            goal_pos[:, 2] += 0.5
             translations.append(goal_pos)
             orientations.append(identity_quat[: len(pos_task_ids)])
             scales.append(torch.tensor((1.0, 1.0, 1.0), device=self.device).repeat(len(pos_task_ids), 1))
             marker_indices.append(torch.full((len(pos_task_ids),), 1, device=self.device, dtype=torch.long))
         if len(pose_task_ids) > 0:
             goal_pos = self.cmd_buf[pose_task_ids, 0, :3].clone()
-            goal_pos[:, 2] += 0.5
             translations.append(goal_pos)
             euler = self.cmd_buf[pose_task_ids, 0, 3:6]
             orientations.append(quat_from_euler_xyz(euler[:, 0], euler[:, 1], euler[:, 2]))
