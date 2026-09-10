@@ -26,6 +26,7 @@ import warp as wp
 from isaaclab.utils.math import (
     axis_angle_from_quat,
     euler_xyz_from_quat,
+    quat_apply,
     quat_apply_inverse,
     quat_from_euler_xyz,
     quat_inv,
@@ -81,7 +82,14 @@ class CommandPayloadBase:
 
     def success(self, error: torch.Tensor, cmd_ids: torch.Tensor) -> torch.Tensor:
         """Return per-env success from command-owned error."""
-        return torch.all(error < self.reward_scales[cmd_ids], dim=1)
+        reached = torch.all(error < self.reward_scales[cmd_ids], dim=1)
+        eps = getattr(self, "success_joint_dev_eps", 0.0)
+        if eps > 0.0:
+            ids = self.success_joint_dev_ids
+            joint_pos = self.robot.data.joint_pos.torch[:, ids]
+            default = self.robot.data.default_joint_pos.torch[:, ids]
+            reached = reached & ((joint_pos - default).abs().amax(dim=1) < eps)
+        return reached
 
     def get_task_done(self) -> torch.Tensor:
         """Per-env done: the hold timer has fully drained."""
@@ -195,6 +203,51 @@ class CommandPayloadBaseState(CommandPayloadBase):
         self.reset_joint_pos_slice = slice(13, 13 + robot.num_joints)
         payload_cfg = cfg.payload
         self.normalize_command_obs = payload_cfg.normalize_command_obs
+        self.success_joint_dev_eps = float(payload_cfg.success_joint_dev_eps)
+        include = [s.strip() for s in str(payload_cfg.success_joint_dev_include).split(",") if s.strip()]
+        if include:
+            dev_ids = [i for i, n in enumerate(robot.joint_names) if any(s in n for s in include)]
+        else:
+            dev_ids = list(range(robot.num_joints))
+        if self.success_joint_dev_eps > 0.0 and not dev_ids:
+            raise ValueError(
+                f"success_joint_dev_include '{payload_cfg.success_joint_dev_include}' matched no joints."
+                f" Available: {robot.joint_names}"
+            )
+        self.success_joint_dev_ids = torch.tensor(dev_ids, device=device, dtype=torch.long)
+        self.success_joint_dev_names = [robot.joint_names[i] for i in dev_ids]
+
+        # Optional tracked body. The target side needs forward kinematics over the stored
+        # target joint angles, so the Newton body id is resolved alongside the PhysX one.
+        self.track_body_offset = torch.tensor(payload_cfg.track_body_offset, device=device)
+        self.track_body_id: int | None = None
+        self.track_body_newton_id: int | None = None
+        if payload_cfg.track_body_name:
+            ids, _ = robot.find_bodies(payload_cfg.track_body_name, preserve_order=True)
+            if len(ids) != 1:
+                raise ValueError(
+                    f"track_body_name '{payload_cfg.track_body_name}' matched {len(ids)} bodies; expected exactly"
+                    f" one. Available: {robot.body_names}"
+                )
+            self.track_body_id = int(ids[0])
+            if table.target_fk_kin is None:
+                raise ValueError("track_body_name requires target_fk_kin on the task table.")
+            newton_names = list(table.target_fk_kin.model.body_label)
+            matches = [i for i, n in enumerate(newton_names) if n.endswith(payload_cfg.track_body_name)]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"track_body_name '{payload_cfg.track_body_name}' matched {len(matches)} Newton bodies;"
+                    f" expected exactly one. Available: {newton_names}"
+                )
+            self.track_body_newton_id = matches[0]
+            model = table.target_fk_kin.model
+            self.target_fk_kin = table.target_fk_kin
+            self.isaac_to_newton_joint_order = table.isaac_to_newton_joint_order
+            self._trk_joint_q = torch.empty(env.num_envs, int(model.joint_coord_count), device=device)
+            self._trk_joint_qd = wp.zeros((env.num_envs, int(model.joint_dof_count)), dtype=wp.float32, device=device)
+            self._trk_body_q_t = torch.empty(env.num_envs, int(model.body_count), 7, device=device)
+            self._trk_body_q = wp.from_torch(self._trk_body_q_t, dtype=wp.transformf)
+            self._trk_body_qd = wp.zeros((env.num_envs, int(model.body_count)), dtype=wp.spatial_vectorf, device=device)
 
         std_attrs = ("pos_std", "rot_std", "lin_vel_std", "ang_vel_std")
         global_stds = (payload_cfg.pos_std, payload_cfg.rot_std, payload_cfg.lin_vel_std, payload_cfg.ang_vel_std)
@@ -248,6 +301,22 @@ class CommandPayloadBaseState(CommandPayloadBase):
                 target_cmd[terrain_local_ids, 3] = roll
                 target_cmd[terrain_local_ids, 4] = pitch
                 target_cmd[terrain_local_ids, 5] = yaw
+        if self.track_body_newton_id is not None:
+            # Replace the root target with where the tracked point ends up once the target
+            # joint angles are applied, so "reach the goal" refers to the same frame the
+            # error is measured in.
+            n = env_ids.numel()
+            joint_q = self._trk_joint_q[:n]
+            joint_q[:, :7] = target_states[:, :7]
+            torch.index_select(
+                target_states[:, self.reset_joint_pos_slice], 1, self.isaac_to_newton_joint_order, out=joint_q[:, 7:]
+            )
+            self.target_fk_kin.eval_fk_batched(
+                wp.from_torch(joint_q), self._trk_joint_qd[:n], self._trk_body_q[:n], self._trk_body_qd[:n]
+            )
+            body_q = self._trk_body_q_t[:n, self.track_body_newton_id]
+            target_cmd[:, :3] = body_q[:, :3] + quat_apply(body_q[:, 3:7], self.track_body_offset.expand(n, 3))
+
         target_cmd[:, self.time_idx].copy_(task_params[:, 12])
 
         self.cmd_buf[:, 0].index_copy_(0, env_ids, target_cmd)
@@ -265,7 +334,12 @@ class CommandPayloadBaseState(CommandPayloadBase):
         root_quat = wp.to_torch(self.robot.data.root_quat_w)
         joint_pos = wp.to_torch(self.robot.data.joint_pos)
 
-        current[:, :3] = root_state_w[:, :3]
+        if self.track_body_id is None:
+            current[:, :3] = root_state_w[:, :3]
+        else:
+            body_pos = self.robot.data.body_pos_w.torch[:, self.track_body_id]
+            body_quat = self.robot.data.body_quat_w.torch[:, self.track_body_id]
+            current[:, :3] = body_pos + quat_apply(body_quat, self.track_body_offset.expand(body_pos.shape[0], 3))
         current[:, 3], current[:, 4], current[:, 5] = euler_xyz_from_quat(root_quat)
         current[:, 6:12] = root_state_w[:, 7:13]
         current[:, self.cmd_joint_pos_slice] = joint_pos

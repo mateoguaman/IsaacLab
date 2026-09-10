@@ -136,6 +136,29 @@ class BaseStatePayloadCfg(StateCommandCfg.PayloadCfg):
     normalize_command_obs: bool = False
     """Whether to divide command channels by the per-task success threshold."""
 
+    success_joint_dev_eps: float = 0.0
+    """Extra success gate: every joint named by :attr:`success_joint_dev_joint_names` must sit
+    within this angle of its default position [rad]. Applied on top of the pose thresholds, so
+    a robot that reaches the goal in a contorted pose does not count as successful. Defaults to
+    0.0, which disables the gate."""
+
+    success_joint_dev_include: str = ""
+    """Comma-separated substrings selecting the joints the gate applies to, e.g.
+    ``"waist,shoulder,elbow,wrist"``. Empty means every joint.
+
+    Deliberately not a regex list: brackets and quotes do not survive being spliced into the
+    SLURM job script, which silently degrades a list into its individual characters. Leg
+    joints also deviate by design — the retarget IK rotates hips to place feet on stones and
+    treads — so gating on them forbids terrain adaptation rather than bad posture."""
+
+    track_body_name: str = ""
+    """Body whose pose is driven to the goal, instead of the articulation root. Empty string
+    keeps the root. The body must survive fixed-joint merging during URDF conversion."""
+
+    track_body_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Offset from :attr:`track_body_name`'s origin to the tracked point, in that body's
+    frame [m]. Lets a frame that was merged away be addressed via its surviving parent."""
+
     goal_visualizer_cfg: VisualizationMarkersCfg = _GOAL_VISUALIZER_CFG
     """Debug marker for the goal state (pos/pose/vel)."""
 
