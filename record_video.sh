@@ -88,8 +88,11 @@ done
 # Always ask Hyak as well as looking locally. Deciding from the local directory alone would
 # pin the run to whatever was fetched first, so a still-training job would never show its
 # newer checkpoints. An unreachable cluster degrades to local-only rather than failing.
+# find, not ls: a glob with no matches makes ls exit non-zero, which under `set -e` with
+# pipefail kills the script before it can ask Hyak — i.e. exactly when the run is new.
 local_ckpts() {
-    ls "$LOCAL_ROOT/$RUN"/model_*.pt 2>/dev/null | xargs -r -n1 basename
+    [ -d "$LOCAL_ROOT/$RUN" ] || return 0
+    find "$LOCAL_ROOT/$RUN" -maxdepth 1 -name 'model_*.pt' -printf '%f\n' 2>/dev/null
 }
 
 REMOTE_LIST=$(remote_ckpts "$RUN")
