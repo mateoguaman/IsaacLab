@@ -85,16 +85,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# A run that is not local is assumed to live on Hyak.
-IS_REMOTE=0
-[ -d "$LOCAL_ROOT/$RUN" ] || IS_REMOTE=1
+# Always ask Hyak as well as looking locally. Deciding from the local directory alone would
+# pin the run to whatever was fetched first, so a still-training job would never show its
+# newer checkpoints. An unreachable cluster degrades to local-only rather than failing.
+local_ckpts() {
+    ls "$LOCAL_ROOT/$RUN"/model_*.pt 2>/dev/null | xargs -r -n1 basename
+}
 
+REMOTE_LIST=$(remote_ckpts "$RUN")
+[ -n "$REMOTE_LIST" ] && HAS_REMOTE=1 || HAS_REMOTE=0
+
+# Newest first, by iteration number: local and remote mtimes are not comparable.
 available() {
-    if [ "$IS_REMOTE" -eq 1 ]; then
-        remote_ckpts "$RUN"
-    else
-        ls -t "$LOCAL_ROOT/$RUN"/model_*.pt 2>/dev/null | xargs -r -n1 basename
-    fi
+    { local_ckpts; printf '%s\n' "$REMOTE_LIST"; } | grep -E '^model_[0-9]+\.pt$' |
+        sort -t_ -k2 -n -r -u
 }
 
 if [ ${#CKPTS[@]} -eq 0 ]; then
@@ -111,7 +115,7 @@ if [ ${#CKPTS[@]} -eq 0 ]; then
     fi
 fi
 
-echo "run        : $RUN  ($([ "$IS_REMOTE" -eq 1 ] && echo "Hyak" || echo local))"
+echo "run        : $RUN  (local: $(local_ckpts | wc -l) ckpts, Hyak: $(printf '%s\n' "$REMOTE_LIST" | grep -c . || true))"
 echo "checkpoints: ${CKPTS[*]}"
 echo "length     : $LENGTH policy steps   envs: $ENVS   gpu: $GPU"
 echo
@@ -125,7 +129,7 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 for CKPT in "${CKPTS[@]}"; do
     CKPT_PATH="$PWD/$LOCAL_ROOT/$RUN/$CKPT"
     if [ ! -f "$CKPT_PATH" ]; then
-        [ "$IS_REMOTE" -eq 1 ] || die "checkpoint not found: $CKPT_PATH"
+        [ "$HAS_REMOTE" -eq 1 ] || die "checkpoint not found locally and $HYAK_HOST has none: $CKPT"
         echo "--- fetching $RUN/$CKPT from $HYAK_HOST"
         rsync -q --info=progress2 \
             "$HYAK_HOST:$REMOTE_ROOT/$RUN/$CKPT" "$LOCAL_ROOT/$RUN/" ||
